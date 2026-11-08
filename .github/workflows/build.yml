@@ -1,1 +1,75 @@
 
+name: Build Android APK
+
+"on":
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "Application name"
+        required: true
+        default: "My APK App"
+      package_id:
+        description: "Android package ID"
+        required: true
+        default: "com.example.myapp"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      APP_NAME: ${{ inputs.app_name }}
+      PACKAGE_ID: ${{ inputs.package_id }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Create Android application
+        run: |
+          npm init -y
+          npm install @capacitor/core@7 @capacitor/android@7
+          npm install --save-dev @capacitor/cli@7
+
+          mkdir -p www
+
+          node -e 'const fs=require("fs"); fs.writeFileSync("capacitor.config.json", JSON.stringify({appId:process.env.PACKAGE_ID,appName:process.env.APP_NAME,webDir:"www"},null,2))'
+
+          cat > www/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>My APK App</title>
+          </head>
+          <body>
+            <h1>My First APK</h1>
+            <p>Cloud APK Builder is working!</p>
+          </body>
+          </html>
+          EOF
+
+          npx cap add android
+          npx cap sync android
+
+      - name: Build APK
+        run: ./gradlew assembleDebug
+        working-directory: android
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
