@@ -5,13 +5,25 @@ name: Build Android APK
   workflow_dispatch:
     inputs:
       app_name:
-        description: "Application name"
+        description: Application name
         required: true
-        default: "My APK App"
+        default: My APK App
       package_id:
-        description: "Android package ID"
+        description: Android package ID
         required: true
-        default: "com.example.myapp"
+        default: com.example.myapp
+      html_b64:
+        description: Base64 HTML source
+        required: false
+        default: ""
+      css_b64:
+        description: Base64 CSS source
+        required: false
+        default: ""
+      js_b64:
+        description: Base64 JavaScript source
+        required: false
+        default: ""
 
 jobs:
   build:
@@ -20,6 +32,9 @@ jobs:
     env:
       APP_NAME: ${{ inputs.app_name }}
       PACKAGE_ID: ${{ inputs.package_id }}
+      HTML_B64: ${{ inputs.html_b64 }}
+      CSS_B64: ${{ inputs.css_b64 }}
+      JS_B64: ${{ inputs.js_b64 }}
 
     steps:
       - name: Checkout source
@@ -46,19 +61,19 @@ jobs:
 
           node -e 'const fs=require("fs"); fs.writeFileSync("capacitor.config.json", JSON.stringify({appId:process.env.PACKAGE_ID,appName:process.env.APP_NAME,webDir:"www"},null,2))'
 
-          cat > www/index.html <<'EOF'
-          <!DOCTYPE html>
-          <html>
-          <head>
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>My APK App</title>
-          </head>
-          <body>
-            <h1>My First APK</h1>
-            <p>Cloud APK Builder is working!</p>
-          </body>
-          </html>
-          EOF
+          if [ -n "$HTML_B64" ]; then
+            printf '%s' "$HTML_B64" | base64 -d > www/index.html
+          else
+            echo '<h1>Cloud APK Builder</h1>' > www/index.html
+          fi
+
+          if [ -n "$CSS_B64" ]; then
+            printf '%s' "$CSS_B64" | base64 -d > www/style.css
+          fi
+
+          if [ -n "$JS_B64" ]; then
+            printf '%s' "$JS_B64" | base64 -d > www/script.js
+          fi
 
           npx cap add android
           npx cap sync android
@@ -72,4 +87,3 @@ jobs:
         with:
           name: android-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
-
