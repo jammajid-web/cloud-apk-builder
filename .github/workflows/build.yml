@@ -82,11 +82,15 @@ jobs:
           npx cap add android
           npx cap sync android
 
+      
       - name: Configure Gradle
         run: |
-          sed -i 's#^distributionUrl=.*#distributionUrl=https\\://downloads.gradle.org/distributions/gradle-8.11.1-bin.zip#' android/gradle/wrapper/gradle-wrapper.properties
+          sed -i 's#^distributionUrl=.*#distributionUrl=https\\://mirrors.huaweicloud.com/gradle/gradle-8.11.1-bin.zip#' android/gradle/wrapper/gradle-wrapper.properties
           sed -i '/^networkTimeout=/d' android/gradle/wrapper/gradle-wrapper.properties
           echo 'networkTimeout=300000' >> android/gradle/wrapper/gradle-wrapper.properties
+          sed -i '/^distributionSha256Sum=/d' android/gradle/wrapper/gradle-wrapper.properties
+          echo 'distributionSha256Sum=f397b287023acdba1e9f6fc5ea72d22dd63669d59ed4a289a29b1a76eee151c6' >> android/gradle/wrapper/gradle-wrapper.properties
+
 
       - name: Setup Gradle Cache
         uses: gradle/actions/setup-gradle@v4
