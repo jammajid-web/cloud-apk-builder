@@ -77,11 +77,9 @@ jobs:
 
           npx cap add android
           npx cap sync android
-                  - name: Configure Gradle timeout
+                        - name: Increase Gradle download timeout
         run: |
-          sed -i '/^networkTimeout=/d' android/gradle/wrapper/gradle-wrapper.properties
-          echo 'networkTimeout=120000' >> android/gradle/wrapper/gradle-wrapper.properties
-
+          sed -i '/^distributionUrl=/a networkTimeout=120000' android/gradle/wrapper/gradle-wrapper.properties
       - name: Build APK
         run: ./gradlew assembleDebug
         working-directory: android
