@@ -8,13 +8,11 @@ name: Build Android APK
         description: Application name
         required: true
         default: My APK App
-        type: string
 
       package_id:
         description: Android package ID
         required: true
         default: com.example.myapp
-        type: string
 
       html_b64:
         description: Base64 HTML source
@@ -84,9 +82,14 @@ jobs:
           npx cap add android
           npx cap sync android
 
-      - name: Configure Gradle download timeout
+      - name: Configure Gradle download
         run: |
+          sed -i 's|^distributionUrl=.*|distributionUrl=https\\://downloads.gradle.org/distributions/gradle-8.11.1-all.zip|' android/gradle/wrapper/gradle-wrapper.properties
+          sed -i '/^networkTimeout=/d' android/gradle/wrapper/gradle-wrapper.properties
           echo 'networkTimeout=300000' >> android/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Setup Gradle Cache
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Build APK
         run: ./gradlew assembleDebug
