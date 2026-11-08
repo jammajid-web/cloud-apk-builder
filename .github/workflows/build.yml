@@ -1,44 +1,45 @@
 
 name: Build Android APK
 
-"on":
+on:
   workflow_dispatch:
     inputs:
       app_name:
-        description: Application name
+        description: "Android application name"
         required: true
-        default: My APK App
+        type: string
+        default: "My App"
 
       package_id:
-        description: Android package ID
+        description: "Android package ID"
         required: true
-        default: com.example.myapp
+        type: string
+        default: "com.example.myapp"
 
-      html_b64:
-        description: Base64 HTML source
+      html:
+        description: "Base64 encoded HTML"
         required: false
+        type: string
         default: ""
 
-      css_b64:
-        description: Base64 CSS source
+      css:
+        description: "Base64 encoded CSS"
         required: false
+        type: string
         default: ""
 
-      js_b64:
-        description: Base64 JavaScript source
+      js:
+        description: "Base64 encoded JavaScript"
         required: false
+        type: string
         default: ""
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
-    env:
-      APP_NAME: ${{ inputs.app_name }}
-      PACKAGE_ID: ${{ inputs.package_id }}
-      HTML_B64: ${{ inputs.html_b64 }}
-      CSS_B64: ${{ inputs.css_b64 }}
-      JS_B64: ${{ inputs.js_b64 }}
 
     steps:
       - name: Checkout source
@@ -47,59 +48,77 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "20"
 
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 21
+          java-version: "17"
 
       - name: Create Android application
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          PACKAGE_ID: ${{ inputs.package_id }}
+          HTML_B64: ${{ inputs.html }}
+          CSS_B64: ${{ inputs.css }}
+          JS_B64: ${{ inputs.js }}
         run: |
-          npm init -y
-          npm install @capacitor/core@7 @capacitor/android@7
-          npm install --save-dev @capacitor/cli@7
+          set -e
 
           mkdir -p www
 
-          node -e 'const fs=require("fs"); fs.writeFileSync("capacitor.config.json", JSON.stringify({appId:process.env.PACKAGE_ID,appName:process.env.APP_NAME,webDir:"www"},null,2))'
+          node <<'NODE'
+          const fs = require("fs");
 
-          if [ -n "$HTML_B64" ]; then
-            printf '%s' "$HTML_B64" | base64 -d > www/index.html
-          else
-            echo '<h1>Cloud APK Builder</h1>' > www/index.html
-          fi
+          const html = Buffer.from(process.env.HTML_B64 || "", "base64").toString("utf8");
+          const css = Buffer.from(process.env.CSS_B64 || "", "base64").toString("utf8");
+          const js = Buffer.from(process.env.JS_B64 || "", "base64").toString("utf8");
 
-          if [ -n "$CSS_B64" ]; then
-            printf '%s' "$CSS_B64" | base64 -d > www/style.css
-          fi
+          fs.writeFileSync("www/index.html", `<!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <link rel="stylesheet" href="style.css">
+          </head>
+          <body>
+          ${html}
+          <script src="script.js"><\/script>
+          </body>
+          </html>`);
 
-          if [ -n "$JS_B64" ]; then
-            printf '%s' "$JS_B64" | base64 -d > www/script.js
-          fi
+          fs.writeFileSync("www/style.css", css);
+          fs.writeFileSync("www/script.js", js);
+          NODE
+
+          npm init -y
+
+          npm install @capacitor/core@6.2.1 @capacitor/cli@6.2.1 @capacitor/android@6.2.1
+
+          npx cap init "$APP_NAME" "$PACKAGE_ID" --web-dir=www
 
           npx cap add android
+
           npx cap sync android
 
-      
       - name: Configure Gradle
         run: |
-          sed -i 's#^distributionUrl=.*#distributionUrl=https\\://mirrors.huaweicloud.com/gradle/gradle-8.11.1-bin.zip#' android/gradle/wrapper/gradle-wrapper.properties
+          sed -i 's#^distributionUrl=.*#distributionUrl=https\://mirrors.huaweicloud.com/gradle/gradle-8.11.1-bin.zip#' android/gradle/wrapper/gradle-wrapper.properties
+
           sed -i '/^networkTimeout=/d' android/gradle/wrapper/gradle-wrapper.properties
+
           echo 'networkTimeout=300000' >> android/gradle/wrapper/gradle-wrapper.properties
+
           sed -i '/^distributionSha256Sum=/d' android/gradle/wrapper/gradle-wrapper.properties
+
           echo 'distributionSha256Sum=f397b287023acdba1e9f6fc5ea72d22dd63669d59ed4a289a29b1a76eee151c6' >> android/gradle/wrapper/gradle-wrapper.properties
-
-
-      - name: Setup Gradle Cache
-        uses: gradle/actions/setup-gradle@v4
 
       - name: Build APK
         run: |
-          chmod +x ./gradlew
+          cd android
+          chmod +x gradlew
           ./gradlew assembleDebug
-        working-directory: android
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -107,3 +126,4 @@ jobs:
           name: android-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          retention-days: 7
