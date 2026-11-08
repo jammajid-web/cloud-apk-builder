@@ -82,9 +82,9 @@ jobs:
           npx cap add android
           npx cap sync android
 
-      - name: Configure Gradle download
+      - name: Configure Gradle
         run: |
-          sed -i 's|^distributionUrl=.*|distributionUrl=https\\://downloads.gradle.org/distributions/gradle-8.11.1-all.zip|' android/gradle/wrapper/gradle-wrapper.properties
+          sed -i 's#^distributionUrl=.*#distributionUrl=https\\://downloads.gradle.org/distributions/gradle-8.11.1-bin.zip#' android/gradle/wrapper/gradle-wrapper.properties
           sed -i '/^networkTimeout=/d' android/gradle/wrapper/gradle-wrapper.properties
           echo 'networkTimeout=300000' >> android/gradle/wrapper/gradle-wrapper.properties
 
@@ -92,7 +92,9 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build APK
-        run: ./gradlew assembleDebug
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug
         working-directory: android
 
       - name: Upload APK
