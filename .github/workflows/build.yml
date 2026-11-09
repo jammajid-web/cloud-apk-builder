@@ -5,22 +5,19 @@ on:
   workflow_dispatch:
     inputs:
       app_name:
-        description: "Android application name"
+        description: "Android App Name"
         required: true
         type: string
-        default: "My App"
 
       package_id:
-        description: "Android package ID"
+        description: "Android Package ID"
         required: true
         type: string
-        default: "com.example.myapp"
 
       html:
         description: "Base64 encoded HTML"
-        required: false
+        required: true
         type: string
-        default: ""
 
       css:
         description: "Base64 encoded CSS"
@@ -34,6 +31,12 @@ on:
         type: string
         default: ""
 
+      branding_key:
+        description: "Unique branding folder in repository"
+        required: false
+        type: string
+        default: ""
+
       ads_enabled:
         description: "Enable AdMob"
         required: false
@@ -41,7 +44,7 @@ on:
         default: false
 
       admob_test_mode:
-        description: "Use Google test ads"
+        description: "Use Google test ad IDs"
         required: false
         type: boolean
         default: true
@@ -53,19 +56,19 @@ on:
         default: ""
 
       admob_banner_id:
-        description: "Banner Ad Unit ID"
+        description: "AdMob Banner Ad Unit ID"
         required: false
         type: string
         default: ""
 
       admob_interstitial_id:
-        description: "Interstitial Ad Unit ID"
+        description: "AdMob Interstitial Ad Unit ID"
         required: false
         type: string
         default: ""
 
       admob_rewarded_id:
-        description: "Rewarded Ad Unit ID"
+        description: "AdMob Rewarded Ad Unit ID"
         required: false
         type: string
         default: ""
@@ -73,169 +76,223 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: android-build-${{ github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   build:
+    name: Build Android APK
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      APP_NAME: ${{ inputs.app_name }}
+      PACKAGE_ID: ${{ inputs.package_id }}
+      BRANDING_KEY: ${{ inputs.branding_key }}
+      ADS_ENABLED: ${{ inputs.ads_enabled }}
+      ADMOB_TEST_MODE: ${{ inputs.admob_test_mode }}
+      ADMOB_APP_ID: ${{ inputs.admob_app_id }}
+      ADMOB_BANNER_ID: ${{ inputs.admob_banner_id }}
+      ADMOB_INTERSTITIAL_ID: ${{ inputs.admob_interstitial_id }}
+      ADMOB_REWARDED_ID: ${{ inputs.admob_rewarded_id }}
 
     steps:
-      - name: Checkout source
+      - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          ref: main
 
-      - name: Setup Node.js
+      - name: Validate Inputs
+        shell: bash
+        run: |
+          set -e
+
+          if [[ ! "$PACKAGE_ID" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]]; then
+            echo "Invalid Android package ID"
+            exit 1
+          fi
+
+          if [ -z "$APP_NAME" ]; then
+            echo "App name is required"
+            exit 1
+          fi
+
+          if [ -z "${{ inputs.html }}" ]; then
+            echo "HTML input is required"
+            exit 1
+          fi
+
+          if [ -n "$BRANDING_KEY" ] && [[ ! "$BRANDING_KEY" =~ ^[a-zA-Z0-9_-]{1,80}$ ]]; then
+            echo "Invalid branding key"
+            exit 1
+          fi
+
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: 20
+          cache: npm
 
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: 17
 
-      - name: Create Android application
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Create Web App
+        shell: bash
         env:
-          APP_NAME: ${{ inputs.app_name }}
-          PACKAGE_ID: ${{ inputs.package_id }}
-          HTML_B64: ${{ inputs.html }}
-          CSS_B64: ${{ inputs.css }}
-          JS_B64: ${{ inputs.js }}
-          ADS_ENABLED: ${{ inputs.ads_enabled }}
-          ADMOB_TEST_MODE: ${{ inputs.admob_test_mode }}
-          ADMOB_APP_ID: ${{ inputs.admob_app_id }}
-          ADMOB_BANNER_ID: ${{ inputs.admob_banner_id }}
-          ADMOB_INTERSTITIAL_ID: ${{ inputs.admob_interstitial_id }}
-          ADMOB_REWARDED_ID: ${{ inputs.admob_rewarded_id }}
-
+          HTML_DATA: ${{ inputs.html }}
+          CSS_DATA: ${{ inputs.css }}
+          JS_DATA: ${{ inputs.js }}
         run: |
           set -e
 
-          if ! [[ "$PACKAGE_ID" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]]; then
-            echo "Invalid Android package ID: $PACKAGE_ID"
-            exit 1
+          mkdir -p www
+
+          printf '%s' "$HTML_DATA" | base64 --decode > www/index.html
+
+          if [ -n "$CSS_DATA" ]; then
+            printf '%s' "$CSS_DATA" | base64 --decode > www/style.css
+          else
+            touch www/style.css
           fi
+
+          if [ -n "$JS_DATA" ]; then
+            printf '%s' "$JS_DATA" | base64 --decode > www/script.js
+          else
+            touch www/script.js
+          fi
+
+      - name: Prepare Custom Branding
+        shell: bash
+        run: |
+          set -e
+
+          if [ -z "$BRANDING_KEY" ]; then
+            echo "Default branding selected"
+            exit 0
+          fi
+
+          BRAND_DIR="branding/$BRANDING_KEY"
+
+          test -f "$BRAND_DIR/icon.png" || {
+            echo "Custom icon missing: $BRAND_DIR/icon.png"
+            exit 1
+          }
+
+          test -f "$BRAND_DIR/splash.png" || {
+            echo "Custom splash missing: $BRAND_DIR/splash.png"
+            exit 1
+          }
+
+          mkdir -p assets
+
+          cp "$BRAND_DIR/icon.png" assets/icon-only.png
+          cp "$BRAND_DIR/icon.png" assets/icon-foreground.png
+          cp "$BRAND_DIR/splash.png" assets/splash.png
+
+          echo "Custom branding images prepared"
+
+      - name: Initialize Capacitor Project
+        shell: bash
+        run: |
+          set -e
+
+          npm init -y
+
+          npm install \
+            @capacitor/core@6.2.1 \
+            @capacitor/cli@6.2.1 \
+            @capacitor/android@6.2.1
+
+          npx cap init "$APP_NAME" "$PACKAGE_ID" --web-dir=www
+
+      - name: Configure AdMob
+        shell: bash
+        run: |
+          set -e
 
           mkdir -p www
 
-          node <<'NODE'
-          const fs = require("fs");
+          if [ "$ADS_ENABLED" != "true" ]; then
+            echo "window.NativeAdMob = null;" > www/admob-runtime.js
+            exit 0
+          fi
 
-          const html = Buffer.from(process.env.HTML_B64 || "", "base64").toString("utf8");
-          const css = Buffer.from(process.env.CSS_B64 || "", "base64").toString("utf8");
-          const js = Buffer.from(process.env.JS_B64 || "", "base64").toString("utf8");
+          npm install @capacitor-community/admob@6 esbuild
 
-          fs.writeFileSync("www/index.html", `<!DOCTYPE html>
-          <html>
-          <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <link rel="stylesheet" href="style.css">
-            <script src="admob-config.js"></script>
-            <script src="admob-runtime.bundle.js"></script>
-          </head>
-          <body>
-          ${html}
-          <script src="script.js"><\/script>
-          </body>
-          </html>`);
+          if [ "$ADMOB_TEST_MODE" = "true" ]; then
+            APP_ID="ca-app-pub-3940256099942544~3347511713"
+            BANNER_ID="ca-app-pub-3940256099942544/6300978111"
+            INTERSTITIAL_ID="ca-app-pub-3940256099942544/1033173712"
+            REWARDED_ID="ca-app-pub-3940256099942544/5224354917"
+          else
+            APP_ID="$ADMOB_APP_ID"
+            BANNER_ID="$ADMOB_BANNER_ID"
+            INTERSTITIAL_ID="$ADMOB_INTERSTITIAL_ID"
+            REWARDED_ID="$ADMOB_REWARDED_ID"
 
-          fs.writeFileSync("www/style.css", css);
-          fs.writeFileSync("www/script.js", js);
-
-          const testMode = process.env.ADMOB_TEST_MODE === "true";
-
-          const config = {
-            enabled: process.env.ADS_ENABLED === "true",
-            testMode,
-            appId: testMode
-              ? "ca-app-pub-3940256099942544~3347511713"
-              : process.env.ADMOB_APP_ID || "",
-            bannerId: testMode
-              ? "ca-app-pub-3940256099942544/6300978111"
-              : process.env.ADMOB_BANNER_ID || "",
-            interstitialId: testMode
-              ? "ca-app-pub-3940256099942544/1033173712"
-              : process.env.ADMOB_INTERSTITIAL_ID || "",
-            rewardedId: testMode
-              ? "ca-app-pub-3940256099942544/5224354917"
-              : process.env.ADMOB_REWARDED_ID || ""
-          };
-
-          fs.writeFileSync(
-            "www/admob-config.js",
-            "window.APK_ADMOB_CONFIG = " + JSON.stringify(config) + ";"
-          );
-          NODE
-
-          if [ "$ADS_ENABLED" = "true" ]; then
-
-            if [ "$ADMOB_TEST_MODE" != "true" ]; then
-              if ! [[ "$ADMOB_APP_ID" =~ ^ca-app-pub-[0-9]+~[0-9]+$ ]]; then
-                echo "Invalid production AdMob App ID"
-                exit 1
-              fi
+            if [[ ! "$APP_ID" =~ ^ca-app-pub-[0-9]+~[0-9]+$ ]]; then
+              echo "Invalid AdMob App ID"
+              exit 1
             fi
+          fi
 
-            npm install @capacitor-community/admob@6 esbuild
+          cat > www/admob-config.js <<EOF
+          window.ADMOB_CONFIG = {
+            enabled: true,
+            testMode: $ADMOB_TEST_MODE,
+            appId: "$APP_ID",
+            bannerId: "$BANNER_ID",
+            interstitialId: "$INTERSTITIAL_ID",
+            rewardedId: "$REWARDED_ID"
+          };
+          EOF
 
-            cat > admob-runtime.js <<'JS'
+          cat > admob-runtime.js <<'EOF'
           import {
             AdMob,
-            AdmobConsentStatus,
             BannerAdSize,
             BannerAdPosition
           } from "@capacitor-community/admob";
 
-          const config = window.APK_ADMOB_CONFIG || {};
+          const config = window.ADMOB_CONFIG || {};
+
           let initialized = false;
 
-          async function initialize() {
-            if (!config.enabled) {
-              throw new Error("AdMob is disabled.");
-            }
+          const NativeAdMob = {
+            getConfig() {
+              return config;
+            },
 
-            if (initialized) return true;
+            async initialize() {
+              if (!config.enabled || initialized) return;
 
-            try {
-              let consent = await AdMob.requestConsentInfo();
+              await AdMob.initialize({
+                initializeForTesting: !!config.testMode
+              });
 
-              if (
-                consent.isConsentFormAvailable &&
-                consent.status === AdmobConsentStatus.REQUIRED
-              ) {
-                consent = await AdMob.showConsentForm();
-              }
-
-              if (!consent.canRequestAds) {
-                throw new Error("AdMob consent is not available yet.");
-              }
-
-              await AdMob.initialize();
               initialized = true;
-              return true;
-
-            } catch (error) {
-              console.error("AdMob initialization:", error);
-              throw error;
-            }
-          }
-
-          window.NativeAdMob = {
-
-            initialize,
+            },
 
             async showBanner() {
-              await initialize();
+              await this.initialize();
 
               if (!config.bannerId) {
-                throw new Error("Banner Ad ID is missing.");
+                throw new Error("Banner Ad ID missing");
               }
 
-              return AdMob.showBanner({
+              await AdMob.showBanner({
                 adId: config.bannerId,
                 adSize: BannerAdSize.ADAPTIVE_BANNER,
                 position: BannerAdPosition.BOTTOM_CENTER,
-                isTesting: config.testMode,
-                margin: 0
+                margin: 0,
+                isTesting: !!config.testMode
               });
             },
 
@@ -248,128 +305,143 @@ jobs:
             },
 
             async showInterstitial() {
-              await initialize();
+              await this.initialize();
 
               if (!config.interstitialId) {
-                throw new Error("Interstitial Ad ID is missing.");
+                throw new Error("Interstitial Ad ID missing");
               }
 
               await AdMob.prepareInterstitial({
                 adId: config.interstitialId,
-                isTesting: config.testMode
+                isTesting: !!config.testMode
               });
 
               return AdMob.showInterstitial();
             },
 
             async showRewarded() {
-              await initialize();
+              await this.initialize();
 
               if (!config.rewardedId) {
-                throw new Error("Rewarded Ad ID is missing.");
+                throw new Error("Rewarded Ad ID missing");
               }
 
               await AdMob.prepareRewardVideoAd({
                 adId: config.rewardedId,
-                isTesting: config.testMode
+                isTesting: !!config.testMode
               });
 
               return AdMob.showRewardVideoAd();
-            },
-
-            getConfig() {
-              return { ...config };
             }
           };
-          JS
 
-            npx esbuild admob-runtime.js \
-              --bundle \
-              --platform=browser \
-              --format=iife \
-              --outfile=www/admob-runtime.bundle.js
+          window.NativeAdMob = NativeAdMob;
+          EOF
 
-          else
+          npx esbuild admob-runtime.js \
+            --bundle \
+            --platform=browser \
+            --format=iife \
+            --outfile=www/admob-runtime.bundle.js
 
-            echo "AdMob disabled. Skipping native AdMob plugin."
+          cat >> www/index.html <<'EOF'
 
-            echo "window.NativeAdMob = null;" > www/admob-runtime.bundle.js
+          <script src="admob-config.js"></script>
+          <script src="admob-runtime.bundle.js"></script>
+          EOF
 
+      - name: Generate Android Branding Resources
+        shell: bash
+        run: |
+          set -e
+
+          if [ -z "$BRANDING_KEY" ]; then
+            echo "Using default Capacitor branding"
+            exit 0
           fi
 
-          npm init -y
+          npm install --save-dev @capacitor/assets@3
 
-          npm install @capacitor/core@6.2.1 @capacitor/cli@6.2.1 @capacitor/android@6.2.1
+          npx capacitor-assets generate --android
 
-          npx cap init "$APP_NAME" "$PACKAGE_ID" --web-dir=www
-
+      - name: Add Android Platform
+        shell: bash
+        run: |
+          set -e
           npx cap add android
 
-          if [ "$ADS_ENABLED" = "true" ]; then
+      - name: Configure Native AdMob App ID
+        shell: bash
+        run: |
+          set -e
 
-            node <<'NODE'
-          const fs = require("fs");
-
-          const appId = process.env.ADMOB_TEST_MODE === "true"
-            ? "ca-app-pub-3940256099942544~3347511713"
-            : process.env.ADMOB_APP_ID;
-
-          if (!appId) {
-            throw new Error("AdMob App ID is required.");
-          }
-
-          const escapeXml = value => value
-            .replace(/&/g, "&amp;")
-            .replace(/"/g, "&quot;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;");
-
-          const stringsDir = "android/app/src/main/res/values";
-          fs.mkdirSync(stringsDir, { recursive: true });
-
-          fs.writeFileSync(
-            stringsDir + "/admob_strings.xml",
-            `<resources>
-              <string name="admob_app_id">${escapeXml(appId)}</string>
-            </resources>`
-          );
-
-          const manifestPath = "android/app/src/main/AndroidManifest.xml";
-          let manifest = fs.readFileSync(manifestPath, "utf8");
-
-          const metadata = `
-              <meta-data
-                  android:name="com.google.android.gms.ads.APPLICATION_ID"
-                  android:value="@string/admob_app_id" />`;
-
-          if (!manifest.includes("com.google.android.gms.ads.APPLICATION_ID")) {
-            manifest = manifest.replace("</application>", metadata + "\n    </application>");
-          }
-
-          fs.writeFileSync(manifestPath, manifest);
-          NODE
-
+          if [ "$ADS_ENABLED" != "true" ]; then
+            echo "AdMob disabled"
+            exit 0
           fi
 
-          npx cap sync android
+          if [ "$ADMOB_TEST_MODE" = "true" ]; then
+            APP_ID="ca-app-pub-3940256099942544~3347511713"
+          else
+            APP_ID="$ADMOB_APP_ID"
+          fi
+
+          mkdir -p android/app/src/main/res/values
+
+          cat > android/app/src/main/res/values/admob_strings.xml <<EOF
+          <resources>
+            <string name="admob_app_id">$APP_ID</string>
+          </resources>
+          EOF
+
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path("android/app/src/main/AndroidManifest.xml")
+          s = p.read_text()
+
+          marker = '<meta-data android:name="com.google.android.gms.ads.APPLICATION_ID"'
+
+          if marker not in s:
+              entry = '''
+              <meta-data
+                  android:name="com.google.android.gms.ads.APPLICATION_ID"
+                  android:value="@string/admob_app_id" />
+          '''
+              s = s.replace("</application>", entry + "\n</application>")
+
+          p.write_text(s)
+          PY
 
       - name: Configure Gradle
+        shell: bash
         run: |
-          sed -i 's#^distributionUrl=.*#distributionUrl=https\://mirrors.huaweicloud.com/gradle/gradle-8.11.1-bin.zip#' android/gradle/wrapper/gradle-wrapper.properties
+          set -e
 
-          sed -i '/^networkTimeout=/d' android/gradle/wrapper/gradle-wrapper.properties
+          GRADLE_FILE="android/gradle/wrapper/gradle-wrapper.properties"
 
-          echo 'networkTimeout=300000' >> android/gradle/wrapper/gradle-wrapper.properties
+          if [ -f "$GRADLE_FILE" ]; then
+            sed -i \
+              's#distributionUrl=.*#distributionUrl=https\\://mirrors.huaweicloud.com/gradle/gradle-8.11.1-bin.zip#' \
+              "$GRADLE_FILE"
 
-          sed -i '/^distributionSha256Sum=/d' android/gradle/wrapper/gradle-wrapper.properties
+            if ! grep -q '^distributionSha256Sum=' "$GRADLE_FILE"; then
+              echo "distributionSha256Sum=f397b287023acdba1e9f6fc5ea72d22dd63669d59ed4a289a29b1a76eee151c6" >> "$GRADLE_FILE"
+            fi
+          fi
 
-          echo 'distributionSha256Sum=f397b287023acdba1e9f6fc5ea72d22dd63669d59ed4a289a29b1a76eee151c6' >> android/gradle/wrapper/gradle-wrapper.properties
-
-      - name: Build APK
+      - name: Sync Capacitor
+        shell: bash
         run: |
-          cd android
+          set -e
+          npx cap sync android
+
+      - name: Build Android APK
+        shell: bash
+        working-directory: android
+        run: |
           chmod +x gradlew
-          ./gradlew assembleDebug
+          ./gradlew assembleDebug --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
