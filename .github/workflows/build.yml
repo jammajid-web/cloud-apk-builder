@@ -34,6 +34,42 @@ on:
         type: string
         default: ""
 
+      ads_enabled:
+        description: "Enable AdMob"
+        required: false
+        type: boolean
+        default: false
+
+      admob_test_mode:
+        description: "Use Google test ads"
+        required: false
+        type: boolean
+        default: true
+
+      admob_app_id:
+        description: "AdMob Android App ID"
+        required: false
+        type: string
+        default: ""
+
+      admob_banner_id:
+        description: "Banner Ad Unit ID"
+        required: false
+        type: string
+        default: ""
+
+      admob_interstitial_id:
+        description: "Interstitial Ad Unit ID"
+        required: false
+        type: string
+        default: ""
+
+      admob_rewarded_id:
+        description: "Rewarded Ad Unit ID"
+        required: false
+        type: string
+        default: ""
+
 permissions:
   contents: read
 
@@ -63,8 +99,20 @@ jobs:
           HTML_B64: ${{ inputs.html }}
           CSS_B64: ${{ inputs.css }}
           JS_B64: ${{ inputs.js }}
+          ADS_ENABLED: ${{ inputs.ads_enabled }}
+          ADMOB_TEST_MODE: ${{ inputs.admob_test_mode }}
+          ADMOB_APP_ID: ${{ inputs.admob_app_id }}
+          ADMOB_BANNER_ID: ${{ inputs.admob_banner_id }}
+          ADMOB_INTERSTITIAL_ID: ${{ inputs.admob_interstitial_id }}
+          ADMOB_REWARDED_ID: ${{ inputs.admob_rewarded_id }}
+
         run: |
           set -e
+
+          if ! [[ "$PACKAGE_ID" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]]; then
+            echo "Invalid Android package ID: $PACKAGE_ID"
+            exit 1
+          fi
 
           mkdir -p www
 
@@ -81,6 +129,8 @@ jobs:
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <link rel="stylesheet" href="style.css">
+            <script src="admob-config.js"></script>
+            <script src="admob-runtime.bundle.js"></script>
           </head>
           <body>
           ${html}
@@ -90,7 +140,162 @@ jobs:
 
           fs.writeFileSync("www/style.css", css);
           fs.writeFileSync("www/script.js", js);
+
+          const testMode = process.env.ADMOB_TEST_MODE === "true";
+
+          const config = {
+            enabled: process.env.ADS_ENABLED === "true",
+            testMode,
+            appId: testMode
+              ? "ca-app-pub-3940256099942544~3347511713"
+              : process.env.ADMOB_APP_ID || "",
+            bannerId: testMode
+              ? "ca-app-pub-3940256099942544/6300978111"
+              : process.env.ADMOB_BANNER_ID || "",
+            interstitialId: testMode
+              ? "ca-app-pub-3940256099942544/1033173712"
+              : process.env.ADMOB_INTERSTITIAL_ID || "",
+            rewardedId: testMode
+              ? "ca-app-pub-3940256099942544/5224354917"
+              : process.env.ADMOB_REWARDED_ID || ""
+          };
+
+          fs.writeFileSync(
+            "www/admob-config.js",
+            "window.APK_ADMOB_CONFIG = " + JSON.stringify(config) + ";"
+          );
           NODE
+
+          if [ "$ADS_ENABLED" = "true" ]; then
+
+            if [ "$ADMOB_TEST_MODE" != "true" ]; then
+              if ! [[ "$ADMOB_APP_ID" =~ ^ca-app-pub-[0-9]+~[0-9]+$ ]]; then
+                echo "Invalid production AdMob App ID"
+                exit 1
+              fi
+            fi
+
+            npm install @capacitor-community/admob@6 esbuild
+
+            cat > admob-runtime.js <<'JS'
+          import {
+            AdMob,
+            AdmobConsentStatus,
+            BannerAdSize,
+            BannerAdPosition
+          } from "@capacitor-community/admob";
+
+          const config = window.APK_ADMOB_CONFIG || {};
+          let initialized = false;
+
+          async function initialize() {
+            if (!config.enabled) {
+              throw new Error("AdMob is disabled.");
+            }
+
+            if (initialized) return true;
+
+            try {
+              let consent = await AdMob.requestConsentInfo();
+
+              if (
+                consent.isConsentFormAvailable &&
+                consent.status === AdmobConsentStatus.REQUIRED
+              ) {
+                consent = await AdMob.showConsentForm();
+              }
+
+              if (!consent.canRequestAds) {
+                throw new Error("AdMob consent is not available yet.");
+              }
+
+              await AdMob.initialize();
+              initialized = true;
+              return true;
+
+            } catch (error) {
+              console.error("AdMob initialization:", error);
+              throw error;
+            }
+          }
+
+          window.NativeAdMob = {
+
+            initialize,
+
+            async showBanner() {
+              await initialize();
+
+              if (!config.bannerId) {
+                throw new Error("Banner Ad ID is missing.");
+              }
+
+              return AdMob.showBanner({
+                adId: config.bannerId,
+                adSize: BannerAdSize.ADAPTIVE_BANNER,
+                position: BannerAdPosition.BOTTOM_CENTER,
+                isTesting: config.testMode,
+                margin: 0
+              });
+            },
+
+            async hideBanner() {
+              return AdMob.hideBanner();
+            },
+
+            async removeBanner() {
+              return AdMob.removeBanner();
+            },
+
+            async showInterstitial() {
+              await initialize();
+
+              if (!config.interstitialId) {
+                throw new Error("Interstitial Ad ID is missing.");
+              }
+
+              await AdMob.prepareInterstitial({
+                adId: config.interstitialId,
+                isTesting: config.testMode
+              });
+
+              return AdMob.showInterstitial();
+            },
+
+            async showRewarded() {
+              await initialize();
+
+              if (!config.rewardedId) {
+                throw new Error("Rewarded Ad ID is missing.");
+              }
+
+              await AdMob.prepareRewardVideoAd({
+                adId: config.rewardedId,
+                isTesting: config.testMode
+              });
+
+              return AdMob.showRewardVideoAd();
+            },
+
+            getConfig() {
+              return { ...config };
+            }
+          };
+          JS
+
+            npx esbuild admob-runtime.js \
+              --bundle \
+              --platform=browser \
+              --format=iife \
+              --outfile=www/admob-runtime.bundle.js
+
+          else
+
+            echo "AdMob disabled. Skipping native AdMob plugin."
+
+            echo "window.NativeAdMob = null;" > www/admob-runtime.bundle.js
+
+          fi
 
           npm init -y
 
@@ -99,6 +304,52 @@ jobs:
           npx cap init "$APP_NAME" "$PACKAGE_ID" --web-dir=www
 
           npx cap add android
+
+          if [ "$ADS_ENABLED" = "true" ]; then
+
+            node <<'NODE'
+          const fs = require("fs");
+
+          const appId = process.env.ADMOB_TEST_MODE === "true"
+            ? "ca-app-pub-3940256099942544~3347511713"
+            : process.env.ADMOB_APP_ID;
+
+          if (!appId) {
+            throw new Error("AdMob App ID is required.");
+          }
+
+          const escapeXml = value => value
+            .replace(/&/g, "&amp;")
+            .replace(/"/g, "&quot;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;");
+
+          const stringsDir = "android/app/src/main/res/values";
+          fs.mkdirSync(stringsDir, { recursive: true });
+
+          fs.writeFileSync(
+            stringsDir + "/admob_strings.xml",
+            `<resources>
+              <string name="admob_app_id">${escapeXml(appId)}</string>
+            </resources>`
+          );
+
+          const manifestPath = "android/app/src/main/AndroidManifest.xml";
+          let manifest = fs.readFileSync(manifestPath, "utf8");
+
+          const metadata = `
+              <meta-data
+                  android:name="com.google.android.gms.ads.APPLICATION_ID"
+                  android:value="@string/admob_app_id" />`;
+
+          if (!manifest.includes("com.google.android.gms.ads.APPLICATION_ID")) {
+            manifest = manifest.replace("</application>", metadata + "\n    </application>");
+          }
+
+          fs.writeFileSync(manifestPath, manifest);
+          NODE
+
+          fi
 
           npx cap sync android
 
