@@ -136,6 +136,7 @@ jobs:
         if: ${{ inputs.ads_enabled == 'true' }}
         run: |
           npm install @capacitor-community/admob@6
+          npm install --no-save esbuild
 
       - name: Prepare AdMob Configuration
         if: ${{ inputs.ads_enabled == 'true' }}
@@ -150,24 +151,28 @@ jobs:
           try {
             config = JSON.parse(process.env.ADMOB_CONFIG || '{}');
           } catch (e) {
-            console.log('AdMob config JSON invalid; using empty config');
+            console.log('Invalid AdMob JSON; using test defaults');
           }
 
-          let appId = config.app_id || '';
+          const testMode = process.env.ADMOB_TEST_MODE === 'true';
 
-          if (process.env.ADMOB_TEST_MODE === 'true' && !appId) {
-            appId = 'ca-app-pub-3940256099942544~3347511713';
-          }
+          const appId = config.app_id ||
+            (testMode ? 'ca-app-pub-3940256099942544~3347511713' : '');
+
+          const bannerId = config.banner_id ||
+            (testMode ? 'ca-app-pub-3940256099942544/6300978111' : '');
+
+          const interstitialId = config.interstitial_id ||
+            (testMode ? 'ca-app-pub-3940256099942544/1033173712' : '');
 
           fs.writeFileSync(
             'www/admob-config.json',
             JSON.stringify({
               enabled: true,
-              test_mode: process.env.ADMOB_TEST_MODE === 'true',
+              test_mode: testMode,
               app_id: appId,
-              banner_id: config.banner_id || '',
-              interstitial_id: config.interstitial_id || '',
-              rewarded_id: config.rewarded_id || ''
+              banner_id: bannerId,
+              interstitial_id: interstitialId
             }, null, 2)
           );
 
@@ -176,6 +181,112 @@ jobs:
             `ADMOB_APP_ID=${appId}\n`
           );
           NODE
+
+      - name: Build AdMob JavaScript Bridge
+        if: ${{ inputs.ads_enabled == 'true' }}
+        run: |
+          mkdir -p src
+
+          cat > src/admob-bridge.js <<'JS'
+          import { Capacitor } from '@capacitor/core';
+          import {
+            AdMob,
+            BannerAdSize,
+            BannerAdPosition
+          } from '@capacitor-community/admob';
+
+          let config = {};
+          let initialized = false;
+          let interstitialReady = false;
+          let initializing = false;
+
+          async function loadInterstitial() {
+            if (!initialized || !config.interstitial_id) return;
+
+            try {
+              await AdMob.prepareInterstitial({
+                adId: config.interstitial_id,
+                isTesting: !!config.test_mode
+              });
+              interstitialReady = true;
+              console.log('Interstitial ready');
+            } catch (error) {
+              interstitialReady = false;
+              console.error('Interstitial load failed:', error);
+            }
+          }
+
+          async function initializeAds() {
+            if (initialized || initializing) return;
+            if (!Capacitor.isNativePlatform()) return;
+
+            initializing = true;
+
+            try {
+              const response = await fetch('./admob-config.json');
+              config = await response.json();
+
+              if (!config.enabled) return;
+
+              await AdMob.initialize();
+              initialized = true;
+
+              if (config.banner_id) {
+                try {
+                  await AdMob.showBanner({
+                    adId: config.banner_id,
+                    adSize: BannerAdSize.ADAPTIVE_BANNER,
+                    position: BannerAdPosition.BOTTOM_CENTER,
+                    margin: 0,
+                    isTesting: !!config.test_mode
+                  });
+                  console.log('Banner displayed');
+                } catch (error) {
+                  console.error('Banner failed:', error);
+                }
+              }
+
+              await loadInterstitial();
+
+            } catch (error) {
+              console.error('AdMob initialization failed:', error);
+            } finally {
+              initializing = false;
+            }
+          }
+
+          async function showInterstitial() {
+            if (!initialized || !interstitialReady) return false;
+
+            interstitialReady = false;
+
+            try {
+              await AdMob.showInterstitial();
+              loadInterstitial();
+              return true;
+            } catch (error) {
+              console.error('Interstitial display failed:', error);
+              loadInterstitial();
+              return false;
+            }
+          }
+
+          window.CalculatorAds = {
+            initialize: initializeAds,
+            showInterstitial: showInterstitial
+          };
+
+          document.addEventListener('DOMContentLoaded', initializeAds);
+          setTimeout(initializeAds, 1000);
+          JS
+
+          npx esbuild src/admob-bridge.js \
+            --bundle \
+            --platform=browser \
+            --format=iife \
+            --outfile=www/admob-bridge.js
+
+          printf '\n<script src="./admob-bridge.js"></script>\n' >> www/index.html
 
       - name: Configure AdMob Manifest
         if: ${{ inputs.ads_enabled == 'true' }}
