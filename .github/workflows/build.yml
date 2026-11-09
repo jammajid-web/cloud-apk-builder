@@ -1,4 +1,56 @@
+name: Build Android APK
 
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "Application Name"
+        required: true
+        type: string
+      package_id:
+        description: "Package ID"
+        required: true
+        type: string
+      html:
+        description: "HTML Code"
+        required: true
+        type: string
+      css:
+        description: "CSS Code"
+        required: false
+        type: string
+      js:
+        description: "JavaScript Code"
+        required: false
+        type: string
+      branding_key:
+        description: "Branding Key"
+        required: false
+        type: string
+      ads_enabled:
+        description: "Enable AdMob"
+        required: false
+        type: string
+      admob_test_mode:
+        description: "AdMob Test Mode"
+        required: false
+        type: string
+      admob_app_id:
+        description: "AdMob App ID"
+        required: false
+        type: string
+      admob_banner_id:
+        description: "AdMob Banner ID"
+        required: false
+        type: string
+      admob_interstitial_id:
+        description: "AdMob Interstitial ID"
+        required: false
+        type: string
+      admob_rewarded_id:
+        description: "AdMob Rewarded ID"
+        required: false
+        type: string
 name: Build Android APK
 
 on:
