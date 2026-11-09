@@ -38,11 +38,13 @@ on:
         description: "Enable AdMob"
         required: false
         type: string
+        default: "false"
 
       admob_test_mode:
         description: "AdMob Test Mode"
         required: false
         type: string
+        default: "true"
 
       admob_config:
         description: "AdMob Configuration JSON"
@@ -52,10 +54,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: apk-build-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build Android APK
     runs-on: ubuntu-latest
+    timeout-minutes: 40
 
     steps:
       - name: Checkout Repository
@@ -66,33 +73,58 @@ jobs:
         env:
           APP_NAME: ${{ inputs.app_name }}
           PACKAGE_ID: ${{ inputs.package_id }}
+          HTML_B64: ${{ inputs.html }}
         run: |
+          set -e
+
           if [ -z "$APP_NAME" ]; then
-            echo "Application name is missing"
+            echo "::error::Application name is missing"
             exit 1
           fi
 
           if [[ ! "$PACKAGE_ID" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]]; then
-            echo "Invalid Android package ID"
+            echo "::error::Invalid Android package ID"
             exit 1
           fi
+
+          if [ -z "$HTML_B64" ]; then
+            echo "::error::HTML input is missing"
+            exit 1
+          fi
+
+          if ! printf '%s' "$HTML_B64" | base64 --decode >/dev/null 2>&1; then
+            echo "::error::HTML is not valid Base64"
+            exit 1
+          fi
+
+          echo "Input validation successful"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+        continue-on-error: true
 
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
+          cache: gradle
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
-        with:
-          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
-          accept-android-sdk-licenses: true
+
+      - name: Install Android SDK Packages
+        shell: bash
+        run: |
+          set -e
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
 
       - name: Prepare Web App
         shell: bash
@@ -101,24 +133,51 @@ jobs:
           CSS_B64: ${{ inputs.css }}
           JS_B64: ${{ inputs.js }}
         run: |
+          set -e
           mkdir -p www
 
           printf '%s' "$HTML_B64" | base64 --decode > www/index.html
 
           if [ -n "$CSS_B64" ]; then
-            printf '\n<style>\n' >> www/index.html
-            printf '%s' "$CSS_B64" | base64 --decode >> www/index.html
-            printf '\n</style>\n' >> www/index.html
+            printf '%s' "$CSS_B64" | base64 --decode > /tmp/app-style.css
+            python3 - <<'PY'
+          from pathlib import Path
+          html = Path("www/index.html")
+          content = html.read_text(encoding="utf-8")
+          css = Path("/tmp/app-style.css").read_text(encoding="utf-8")
+          style = "\n<style>\n" + css + "\n</style>\n"
+          if "</head>" in content.lower():
+              import re
+              content = re.sub(r"</head>", lambda m: style + m.group(0), content, count=1, flags=re.I)
+          else:
+              content = style + content
+          html.write_text(content, encoding="utf-8")
+          PY
           fi
 
           if [ -n "$JS_B64" ]; then
-            printf '\n<script>\n' >> www/index.html
-            printf '%s' "$JS_B64" | base64 --decode >> www/index.html
-            printf '\n</script>\n' >> www/index.html
+            printf '%s' "$JS_B64" | base64 --decode > /tmp/app-script.js
+            python3 - <<'PY'
+          from pathlib import Path
+          html = Path("www/index.html")
+          content = html.read_text(encoding="utf-8")
+          js = Path("/tmp/app-script.js").read_text(encoding="utf-8")
+          script = "\n<script>\n" + js + "\n</script>\n"
+          if "</body>" in content.lower():
+              import re
+              content = re.sub(r"</body>", lambda m: script + m.group(0), content, count=1, flags=re.I)
+          else:
+              content += script
+          html.write_text(content, encoding="utf-8")
+          PY
           fi
+
+          test -s www/index.html
+          echo "Web app prepared"
 
       - name: Install Capacitor
         run: |
+          set -e
           npm init -y
           npm install @capacitor/core@6.2.1
           npm install @capacitor/cli@6.2.1
@@ -129,14 +188,16 @@ jobs:
           APP_NAME: ${{ inputs.app_name }}
           PACKAGE_ID: ${{ inputs.package_id }}
         run: |
+          set -e
           npx cap init "$APP_NAME" "$PACKAGE_ID" --web-dir www
           npx cap add android
 
       - name: Install AdMob
         if: ${{ inputs.ads_enabled == 'true' }}
         run: |
+          set -e
           npm install @capacitor-community/admob@6
-          npm install --no-save esbuild
+          npm install --save-dev esbuild
 
       - name: Prepare AdMob Configuration
         if: ${{ inputs.ads_enabled == 'true' }}
@@ -144,17 +205,20 @@ jobs:
           ADMOB_CONFIG: ${{ inputs.admob_config }}
           ADMOB_TEST_MODE: ${{ inputs.admob_test_mode }}
         run: |
+          set -e
           node <<'NODE'
           const fs = require('fs');
 
           let config = {};
+
           try {
             config = JSON.parse(process.env.ADMOB_CONFIG || '{}');
-          } catch (e) {
-            console.log('Invalid AdMob JSON; using test defaults');
+          } catch (error) {
+            console.error('Invalid AdMob configuration JSON');
+            process.exit(1);
           }
 
-          const testMode = process.env.ADMOB_TEST_MODE === 'true';
+          const testMode = process.env.ADMOB_TEST_MODE !== 'false';
 
           const appId = config.app_id ||
             (testMode ? 'ca-app-pub-3940256099942544~3347511713' : '');
@@ -164,6 +228,10 @@ jobs:
 
           const interstitialId = config.interstitial_id ||
             (testMode ? 'ca-app-pub-3940256099942544/1033173712' : '');
+
+          if (!appId || !bannerId || !interstitialId) {
+            throw new Error('AdMob IDs are missing. Enable test mode or provide valid IDs.');
+          }
 
           fs.writeFileSync(
             'www/admob-config.json',
@@ -180,11 +248,14 @@ jobs:
             process.env.GITHUB_ENV,
             `ADMOB_APP_ID=${appId}\n`
           );
+
+          console.log('AdMob configuration prepared');
           NODE
 
       - name: Build AdMob JavaScript Bridge
         if: ${{ inputs.ads_enabled == 'true' }}
         run: |
+          set -e
           mkdir -p src
 
           cat > src/admob-bridge.js <<'JS'
@@ -197,8 +268,8 @@ jobs:
 
           let config = {};
           let initialized = false;
-          let interstitialReady = false;
           let initializing = false;
+          let interstitialReady = false;
 
           async function loadInterstitial() {
             if (!initialized || !config.interstitial_id) return;
@@ -208,6 +279,7 @@ jobs:
                 adId: config.interstitial_id,
                 isTesting: !!config.test_mode
               });
+
               interstitialReady = true;
               console.log('Interstitial ready');
             } catch (error) {
@@ -224,6 +296,11 @@ jobs:
 
             try {
               const response = await fetch('./admob-config.json');
+
+              if (!response.ok) {
+                throw new Error('AdMob config file not found');
+              }
+
               config = await response.json();
 
               if (!config.enabled) return;
@@ -240,6 +317,15 @@ jobs:
                     margin: 0,
                     isTesting: !!config.test_mode
                   });
+
+                  document.documentElement.style.setProperty(
+                    '--admob-banner-space',
+                    '60px'
+                  );
+
+                  document.body.style.paddingBottom =
+                    'calc(60px + env(safe-area-inset-bottom, 0px))';
+
                   console.log('Banner displayed');
                 } catch (error) {
                   console.error('Banner failed:', error);
@@ -262,22 +348,29 @@ jobs:
 
             try {
               await AdMob.showInterstitial();
-              loadInterstitial();
+              void loadInterstitial();
               return true;
             } catch (error) {
               console.error('Interstitial display failed:', error);
-              loadInterstitial();
+              void loadInterstitial();
               return false;
             }
           }
 
           window.CalculatorAds = {
             initialize: initializeAds,
-            showInterstitial: showInterstitial
+            showInterstitial
           };
 
-          document.addEventListener('DOMContentLoaded', initializeAds);
-          setTimeout(initializeAds, 1000);
+          if (document.readyState === 'loading') {
+            document.addEventListener(
+              'DOMContentLoaded',
+              initializeAds,
+              { once: true }
+            );
+          } else {
+            void initializeAds();
+          }
           JS
 
           npx esbuild src/admob-bridge.js \
@@ -293,6 +386,7 @@ jobs:
         env:
           ADMOB_APP_ID: ${{ env.ADMOB_APP_ID }}
         run: |
+          set -e
           python3 <<'PY'
           import os
           import re
@@ -305,19 +399,21 @@ jobs:
 
           app_id = os.environ.get("ADMOB_APP_ID", "").strip()
 
-          if app_id:
-              metadata = (
-                  '<meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" '
-                  f'android:value="{escape(app_id)}" />'
-              )
+          if not app_id:
+              raise SystemExit("AdMob App ID is missing")
 
-              if "com.google.android.gms.ads.APPLICATION_ID" not in content:
-                  content = re.sub(
-                      r"</application>",
-                      metadata + "\n    </application>",
-                      content,
-                      count=1
-                  )
+          metadata = (
+              '<meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" '
+              f'android:value="{escape(app_id)}" />'
+          )
+
+          if "com.google.android.gms.ads.APPLICATION_ID" not in content:
+              content = re.sub(
+                  r"</application>",
+                  metadata + "\n    </application>",
+                  content,
+                  count=1
+              )
 
           with open(path, "w", encoding="utf-8") as f:
               f.write(content)
@@ -328,6 +424,7 @@ jobs:
         env:
           BRANDING_KEY: ${{ inputs.branding_key }}
         run: |
+          set -e
           mkdir -p assets
 
           if [ -f "branding/$BRANDING_KEY/icon.png" ]; then
@@ -341,10 +438,14 @@ jobs:
           if [ -f assets/icon.png ] || [ -f assets/splash.png ]; then
             npm install --save-dev @capacitor/assets@3
             npx capacitor-assets generate --android
+          else
+            echo "No custom branding assets found; using default assets"
           fi
 
       - name: Sync Android
-        run: npx cap sync android
+        run: |
+          set -e
+          npx cap sync android
 
       - name: Configure Gradle
         run: |
@@ -352,18 +453,22 @@ jobs:
 
       - name: Build Android APK
         run: |
+          set -e
           cd android
           ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Verify APK
+        shell: bash
         run: |
+          set -e
           APK="android/app/build/outputs/apk/debug/app-debug.apk"
 
-          if [ ! -f "$APK" ]; then
-            echo "APK file was not generated"
+          if [ ! -s "$APK" ]; then
+            echo "::error::APK file was not generated"
             exit 1
           fi
 
+          echo "APK successfully generated"
           ls -lh "$APK"
 
       - name: Upload APK
