@@ -8,48 +8,44 @@ on:
         description: "Application Name"
         required: true
         type: string
+
       package_id:
-        description: "Package ID"
+        description: "Android Package ID"
         required: true
         type: string
+
       html:
-        description: "HTML Code Base64"
+        description: "HTML Base64"
         required: true
         type: string
+
       css:
-        description: "CSS Code Base64"
+        description: "CSS Base64"
         required: false
         type: string
+
       js:
-        description: "JavaScript Code Base64"
+        description: "JavaScript Base64"
         required: false
         type: string
+
       branding_key:
-        description: "Branding Key"
+        description: "Custom Branding Key"
         required: false
         type: string
+
       ads_enabled:
         description: "Enable AdMob"
         required: false
         type: string
+
       admob_test_mode:
         description: "AdMob Test Mode"
         required: false
         type: string
-      admob_app_id:
-        description: "AdMob App ID"
-        required: false
-        type: string
-      admob_banner_id:
-        description: "AdMob Banner ID"
-        required: false
-        type: string
-      admob_interstitial_id:
-        description: "AdMob Interstitial ID"
-        required: false
-        type: string
-      admob_rewarded_id:
-        description: "AdMob Rewarded ID"
+
+      admob_config:
+        description: "AdMob Configuration JSON"
         required: false
         type: string
 
@@ -67,18 +63,19 @@ jobs:
 
       - name: Validate Inputs
         shell: bash
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          PACKAGE_ID: ${{ inputs.package_id }}
         run: |
           if [ -z "$APP_NAME" ]; then
             echo "Application name is missing"
             exit 1
           fi
+
           if [[ ! "$PACKAGE_ID" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]]; then
-            echo "Invalid package ID"
+            echo "Invalid Android package ID"
             exit 1
           fi
-        env:
-          APP_NAME: ${{ inputs.app_name }}
-          PACKAGE_ID: ${{ inputs.package_id }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -92,32 +89,42 @@ jobs:
           java-version: "17"
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: |
+            platform-tools
+            platforms;android-34
+            build-tools;34.0.0
+          accept-android-sdk-licenses: true
 
       - name: Prepare Web App
         shell: bash
+        env:
+          HTML_B64: ${{ inputs.html }}
+          CSS_B64: ${{ inputs.css }}
+          JS_B64: ${{ inputs.js }}
         run: |
           mkdir -p www
-          echo '${{ inputs.html }}' | base64 -d > www/index.html
-          echo '${{ inputs.css }}' | base64 -d > /tmp/app.css
-          echo '${{ inputs.js }}' | base64 -d > /tmp/app.js
 
-          if [ -s /tmp/app.css ]; then
+          printf '%s' "$HTML_B64" | base64 --decode > www/index.html
+
+          if [ -n "$CSS_B64" ]; then
             printf '\n<style>\n' >> www/index.html
-            cat /tmp/app.css >> www/index.html
+            printf '%s' "$CSS_B64" | base64 --decode >> www/index.html
             printf '\n</style>\n' >> www/index.html
           fi
 
-          if [ -s /tmp/app.js ]; then
+          if [ -n "$JS_B64" ]; then
             printf '\n<script>\n' >> www/index.html
-            cat /tmp/app.js >> www/index.html
+            printf '%s' "$JS_B64" | base64 --decode >> www/index.html
             printf '\n</script>\n' >> www/index.html
           fi
 
       - name: Install Capacitor
         run: |
           npm init -y
-          npm install @capacitor/core@6.2.1 @capacitor/cli@6.2.1
+          npm install @capacitor/core@6.2.1
+          npm install @capacitor/cli@6.2.1
           npm install @capacitor/android@6.2.1
 
       - name: Configure Capacitor
@@ -128,22 +135,101 @@ jobs:
           npx cap init "$APP_NAME" "$PACKAGE_ID" --web-dir www
           npx cap add android
 
-      - name: Install AdMob Plugin
+      - name: Install AdMob
         if: ${{ inputs.ads_enabled == 'true' }}
-        run: npm install @capacitor-community/admob@6
+        run: |
+          npm install @capacitor-community/admob@6
 
-      - name: Prepare Branding
+      - name: Prepare AdMob Configuration
+        if: ${{ inputs.ads_enabled == 'true' }}
+        env:
+          ADMOB_CONFIG: ${{ inputs.admob_config }}
+          ADMOB_TEST_MODE: ${{ inputs.admob_test_mode }}
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+
+          let config = {};
+          try {
+            config = JSON.parse(process.env.ADMOB_CONFIG || '{}');
+          } catch (e) {
+            console.log('AdMob config JSON invalid; using empty config');
+          }
+
+          let appId = config.app_id || '';
+
+          if (process.env.ADMOB_TEST_MODE === 'true' && !appId) {
+            appId = 'ca-app-pub-3940256099942544~3347511713';
+          }
+
+          fs.writeFileSync(
+            'www/admob-config.json',
+            JSON.stringify({
+              enabled: true,
+              test_mode: process.env.ADMOB_TEST_MODE === 'true',
+              app_id: appId,
+              banner_id: config.banner_id || '',
+              interstitial_id: config.interstitial_id || '',
+              rewarded_id: config.rewarded_id || ''
+            }, null, 2)
+          );
+
+          fs.appendFileSync(
+            process.env.GITHUB_ENV,
+            `ADMOB_APP_ID=${appId}\n`
+          );
+          NODE
+
+      - name: Configure AdMob Manifest
+        if: ${{ inputs.ads_enabled == 'true' }}
+        env:
+          ADMOB_APP_ID: ${{ env.ADMOB_APP_ID }}
+        run: |
+          python3 <<'PY'
+          import os
+          import re
+          from xml.sax.saxutils import escape
+
+          path = "android/app/src/main/AndroidManifest.xml"
+
+          with open(path, "r", encoding="utf-8") as f:
+              content = f.read()
+
+          app_id = os.environ.get("ADMOB_APP_ID", "").strip()
+
+          if app_id:
+              metadata = (
+                  '<meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" '
+                  f'android:value="{escape(app_id)}" />'
+              )
+
+              if "com.google.android.gms.ads.APPLICATION_ID" not in content:
+                  content = re.sub(
+                      r"</application>",
+                      metadata + "\n    </application>",
+                      content,
+                      count=1
+                  )
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(content)
+          PY
+
+      - name: Prepare Custom Branding
         if: ${{ inputs.branding_key != '' }}
         env:
           BRANDING_KEY: ${{ inputs.branding_key }}
         run: |
           mkdir -p assets
+
           if [ -f "branding/$BRANDING_KEY/icon.png" ]; then
             cp "branding/$BRANDING_KEY/icon.png" assets/icon.png
           fi
+
           if [ -f "branding/$BRANDING_KEY/splash.png" ]; then
             cp "branding/$BRANDING_KEY/splash.png" assets/splash.png
           fi
+
           if [ -f assets/icon.png ] || [ -f assets/splash.png ]; then
             npm install --save-dev @capacitor/assets@3
             npx capacitor-assets generate --android
@@ -154,15 +240,25 @@ jobs:
 
       - name: Configure Gradle
         run: |
-          cd android
-          chmod +x gradlew
+          chmod +x android/gradlew
 
-      - name: Build Debug APK
+      - name: Build Android APK
         run: |
           cd android
-          ./gradlew assembleDebug --no-daemon
+          ./gradlew assembleDebug --no-daemon --stacktrace
 
-      - name: Upload APK Artifact
+      - name: Verify APK
+        run: |
+          APK="android/app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ ! -f "$APK" ]; then
+            echo "APK file was not generated"
+            exit 1
+          fi
+
+          ls -lh "$APK"
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: android-apk
