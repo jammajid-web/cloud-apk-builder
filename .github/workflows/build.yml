@@ -104,8 +104,7 @@ jobs:
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
-      # IMPORTANT: Draft releases are fetched through the releases list API.
-      # The /releases/tags/{tag} endpoint may return 404 for draft releases.
+      # Draft releases are fetched through the releases list API.
       - name: Download source ZIP from draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -636,11 +635,13 @@ jobs:
                       .replace(">","&gt;")
           )
 
+          # FIX: Define both resources required by the Android manifest.
           strings.write_text(
               '<?xml version="1.0" encoding="utf-8"?>\n'
-              '<resources><string name="app_name">' +
-              safe_name +
-              '</string></resources>\n'
+              '<resources>'
+              '<string name="app_name">' + safe_name + '</string>'
+              '<string name="title_activity_main">' + safe_name + '</string>'
+              '</resources>\n'
           )
           PY
 
@@ -675,7 +676,6 @@ jobs:
           echo "path=output/app-debug.apk" >> "$GITHUB_OUTPUT"
           ls -lh output/app-debug.apk
 
-      # IMPORTANT: Find the draft release through the releases list API.
       - name: Upload APK to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
