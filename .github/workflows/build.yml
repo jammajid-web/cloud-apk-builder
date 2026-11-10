@@ -1,21 +1,17 @@
 
-name: Cloud APK Builder
-
+name: Advanced Cloud APK Builder
 run-name: APK Builder - ${{ inputs.run_id }}
 
 on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: Unique build ID
         required: true
         type: string
       release_tag:
-        description: GitHub Release tag
         required: true
         type: string
       manifest_json:
-        description: App build configuration
         required: true
         type: string
 
@@ -29,9 +25,8 @@ concurrency:
 
 jobs:
   build:
-    name: Build Android App
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
 
     env:
       GH_TOKEN: ${{ github.token }}
@@ -41,97 +36,114 @@ jobs:
       MANIFEST_JSON: ${{ inputs.manifest_json }}
 
     steps:
-      - name: Checkout builder
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate build request
-        shell: bash
+      - name: Validate manifest
         run: |
-          set -euo pipefail
-
           python3 - <<'PY'
           import json, os, re
 
-          run_id = os.environ["RUN_ID"]
-          tag = os.environ["RELEASE_TAG"]
-          raw = os.environ["MANIFEST_JSON"]
+          d=json.loads(os.environ["MANIFEST_JSON"])
+          assert isinstance(d,dict)
+          assert re.fullmatch(r"[a-f0-9-]{36}",os.environ["RUN_ID"],re.I)
+          assert re.fullmatch(r"[A-Za-z0-9._-]{1,100}",os.environ["RELEASE_TAG"])
 
-          if not re.fullmatch(r"[a-fA-F0-9-]{20,64}", run_id):
-              raise SystemExit("Invalid run_id")
+          p=d.get("package_id","com.example.app")
+          assert re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+",p)
 
-          if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", tag):
-              raise SystemExit("Invalid release tag")
+          b=d.get("backend",{})
+          assert b.get("provider","none") in ("none","supabase","firebase")
 
-          data = json.loads(raw)
+          a=d.get("admob",{})
+          assert isinstance(a,dict)
 
-          if not isinstance(data, dict):
-              raise SystemExit("Manifest must be a JSON object")
-
-          print("Build request validated.")
-          print("App:", data.get("app_name", "My App"))
-          print("Package:", data.get("package_id", "com.example.app"))
+          print("Manifest valid")
+          print("App:",d.get("app_name","My App"))
+          print("Backend:",b.get("provider","none"))
+          print("AdMob:",bool(a.get("enabled")))
           PY
 
-      - name: Download project source
-        shell: bash
+      - name: Download source ZIP
         run: |
-          set -euo pipefail
-
           mkdir -p source project output
-
           gh release download "$RELEASE_TAG" \
             --repo "$GH_REPO" \
-            --pattern "source.zip" \
+            --pattern source.zip \
             --dir source
-
           test -s source/source.zip
 
+      - name: Safely extract source
+        run: |
           python3 - <<'PY'
-          import zipfile
+          import zipfile, os, stat
           from pathlib import PurePosixPath
 
-          archive = zipfile.ZipFile("source/source.zip")
+          dest=os.path.abspath("project")
+          with zipfile.ZipFile("source/source.zip") as z:
+              items=z.infolist()
+              if len(items)>10000:
+                  raise SystemExit("Too many ZIP entries")
+              if sum(x.file_size for x in items)>500*1024*1024:
+                  raise SystemExit("Project expands beyond 500 MB")
 
-          for item in archive.infolist():
-              path = PurePosixPath(item.filename)
+              for x in items:
+                  name=x.filename.replace("\\","/")
+                  p=PurePosixPath(name)
+                  mode=x.external_attr >> 16
+                  if p.is_absolute() or ".." in p.parts:
+                      raise SystemExit("Unsafe ZIP path")
+                  if stat.S_ISLNK(mode):
+                      raise SystemExit("ZIP symlinks are not allowed")
+                  target=os.path.abspath(os.path.join(dest,name))
+                  if os.path.commonpath([dest,target]) != dest:
+                      raise SystemExit("ZIP path traversal")
 
-              if path.is_absolute() or ".." in path.parts:
-                  raise SystemExit("Unsafe path found in project ZIP")
-
-              if item.filename.startswith("/"):
-                  raise SystemExit("Absolute ZIP path rejected")
-
-          archive.extractall("project")
-          print("Project extracted safely.")
+              for x in items:
+                  target=os.path.abspath(os.path.join(dest,x.filename))
+                  if x.is_dir():
+                      os.makedirs(target,exist_ok=True)
+                  else:
+                      os.makedirs(os.path.dirname(target),exist_ok=True)
+                      with z.open(x) as src, open(target,"wb") as out:
+                          while True:
+                              chunk=src.read(1024*1024)
+                              if not chunk: break
+                              out.write(chunk)
+          print("Source extracted")
           PY
 
-      - name: Read app configuration
-        shell: bash
+      - name: Load manifest values
         run: |
-          set -euo pipefail
-
           python3 - <<'PY'
-          import json, os, re
-
-          data = json.loads(os.environ["MANIFEST_JSON"])
-
-          app_name = str(data.get("app_name") or "My App")
-          package_id = str(data.get("package_id") or "com.example.app")
-          version = str(data.get("version") or "1.0.0")
-          version_code = str(data.get("version_code") or "1")
-
-          if not re.fullmatch(r"[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+", package_id):
-              raise SystemExit("Invalid package ID")
-
-          if not version_code.isdigit():
-              raise SystemExit("Invalid version code")
-
-          with open(os.environ["GITHUB_ENV"], "a") as f:
-              f.write("APP_NAME=" + app_name.replace("\n", " ").replace("\r", " ") + "\n")
-              f.write("PACKAGE_ID=" + package_id + "\n")
-              f.write("APP_VERSION=" + version + "\n")
-              f.write("VERSION_CODE=" + version_code + "\n")
+          import json, os
+          d=json.loads(os.environ["MANIFEST_JSON"])
+          with open(os.environ["GITHUB_ENV"],"a") as f:
+              for k,v in {
+                "APP_NAME":str(d.get("app_name","My App")),
+                "PACKAGE_ID":str(d.get("package_id","com.example.app")),
+                "APP_VERSION":str(d.get("version","1.0.0")),
+                "VERSION_CODE":str(d.get("version_code","1"))
+              }.items():
+                f.write(k+"="+v.replace("\n"," ").replace("\r"," ")+"\n")
+          with open("manifest.json","w") as f:
+              json.dump(d,f)
           PY
+
+      - name: Detect project
+        id: detect
+        run: |
+          if find project -name gradlew -type f \
+            -not -path '*/node_modules/*' | grep -q .; then
+            echo "type=native" >> "$GITHUB_OUTPUT"
+          elif find project -name index.html -type f \
+            -not -path '*/node_modules/*' \
+            -not -path '*/android/*' | grep -q .; then
+            echo "type=web" >> "$GITHUB_OUTPUT"
+          else
+            echo "Project must contain index.html or Android gradlew"
+            exit 1
+          fi
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -142,180 +154,355 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK packages
-        shell: bash
+      - name: Install SDK
         run: |
-          set -euo pipefail
-
           sdkmanager "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
 
-      - name: Detect project type
-        id: detect
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if find project -name gradlew -type f \
-            -not -path '*/node_modules/*' | grep -q .; then
-
-            echo "type=native" >> "$GITHUB_OUTPUT"
-            echo "Native Android Gradle project detected."
-
-          elif find project -name index.html -type f \
-            -not -path '*/node_modules/*' \
-            -not -path '*/android/*' | grep -q .; then
-
-            echo "type=web" >> "$GITHUB_OUTPUT"
-            echo "Web project detected."
-
-          else
-            echo "Unsupported project."
-            echo "ZIP must contain an Android Gradle project or web app with index.html."
-            exit 1
-          fi
-
-      - name: Build web project with Capacitor
+      - name: Prepare web project and Capacitor
         if: steps.detect.outputs.type == 'web'
-        shell: bash
         run: |
           set -euo pipefail
-
           cd project
 
           ROOT="$(find . -name index.html -type f \
             -not -path './node_modules/*' \
-            -not -path './android/*' \
-            -not -path './.git/*' | head -n 1)"
-
+            -not -path './android/*' | head -n 1)"
           test -n "$ROOT"
-
           WEB_DIR="$(dirname "$ROOT")"
 
-          mkdir -p /tmp/cap-www
-
-          rsync -a \
-            --exclude='node_modules' \
-            --exclude='android' \
-            --exclude='.git' \
-            "$WEB_DIR"/ /tmp/cap-www/
-
+          mkdir -p /tmp/webroot
+          rsync -a --exclude=node_modules --exclude=android \
+            --exclude=.git "$WEB_DIR"/ /tmp/webroot/
           rm -rf www
-          mv /tmp/cap-www www
+          mv /tmp/webroot www
 
-          if [ ! -f package.json ]; then
-            npm init -y
-          fi
+          [ -f package.json ] || npm init -y
 
           npm install @capacitor/core@6 \
             @capacitor/cli@6 \
             @capacitor/android@6
 
-          cat > capacitor.config.json <<EOF
-          {
-            "appId": "$PACKAGE_ID",
-            "appName": "$APP_NAME",
-            "webDir": "www",
-            "bundledWebRuntime": false
-          }
-          EOF
+          python3 - <<'PY'
+          import json, os
+          d=json.load(open("../manifest.json"))
+          cfg={"appId":d.get("package_id","com.example.app"),
+               "appName":d.get("app_name","My App"),
+               "webDir":"www"}
+          json.dump(cfg,open("capacitor.config.json","w"),indent=2)
+          PY
 
+      - name: Generate backend runtime
+        if: steps.detect.outputs.type == 'web'
+        run: |
+          python3 - <<'PY'
+          import json, os
+
+          d=json.load(open("manifest.json"))
+          b=d.get("backend",{"provider":"none"})
+          provider=b.get("provider","none")
+
+          cfg={"provider":provider,"features":b.get("features",{})}
+          if provider=="supabase":
+              cfg["url"]=b["url"]
+              cfg["publishable_key"]=b["publishable_key"]
+          elif provider=="firebase":
+              cfg["firebase"]=b["config"]
+
+          json.dump(cfg,open("project/www/builder-config.json","w"))
+
+          js=r'''
+          (function(){
+            const c=window.APP_BACKEND_CONFIG;
+            window.APP_BACKEND=null;
+            window.APP_BACKEND_READY=(async()=>{
+              if(c.provider==="supabase"){
+                const s=document.createElement("script");
+                s.src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2";
+                document.head.appendChild(s);
+                await new Promise((r,j)=>{s.onload=r;s.onerror=j});
+                window.APP_BACKEND=window.supabase.createClient(c.url,c.publishable_key);
+              }else if(c.provider==="firebase"){
+                const base="https://www.gstatic.com/firebasejs/10.14.1/";
+                const load=(n)=>new Promise((r,j)=>{
+                  const s=document.createElement("script");
+                  s.src=base+n+"-compat.js";s.onload=r;s.onerror=j;
+                  document.head.appendChild(s);
+                });
+                await load("firebase-app");
+                window.APP_FIREBASE=firebase.initializeApp(c.firebase);
+                if(c.features?.auth) await load("firebase-auth");
+                if(c.features?.firestore) await load("firebase-firestore");
+                if(c.features?.storage) await load("firebase-storage");
+                if(c.features?.realtime_database) await load("firebase-database");
+                window.APP_BACKEND={
+                  app:window.APP_FIREBASE,
+                  auth:c.features?.auth?firebase.auth():null,
+                  firestore:c.features?.firestore?firebase.firestore():null,
+                  storage:c.features?.storage?firebase.storage():null,
+                  database:c.features?.realtime_database?firebase.database():null
+                };
+              }
+              return window.APP_BACKEND;
+            })();
+          })();
+          '''
+          js="window.APP_BACKEND_CONFIG="+json.dumps(cfg)+";\n"+js
+          open("project/www/builder-backend.js","w").write(js)
+
+          index="project/www/index.html"
+          page=open(index,encoding="utf-8").read()
+          tag='<script src="./builder-backend.js"></script>'
+          if "builder-backend.js" not in page:
+              pos=page.lower().rfind("</head>")
+              page=page[:pos]+tag+page[pos:] if pos>=0 else tag+page
+          open(index,"w",encoding="utf-8").write(page)
+          PY
+
+      - name: Install Capacitor AdMob plugin
+        if: steps.detect.outputs.type == 'web'
+        run: |
+          cd project
+          python3 - <<'PY'
+          import json
+          d=json.load(open("../manifest.json"))
+          if d.get("admob",{}).get("enabled"):
+              print("AdMob enabled")
+          else:
+              print("AdMob disabled")
+          PY
+          if python3 -c 'import json; exit(0 if json.load(open("../manifest.json")).get("admob",{}).get("enabled") else 1)'; then
+            npm install @capacitor-community/admob@6
+          fi
+
+      - name: Generate AdMob runtime
+        if: steps.detect.outputs.type == 'web'
+        run: |
+          set -euo pipefail
+          cd project
+
+          python3 - <<'PY'
+          import json
+          d=json.load(open("../manifest.json"))
+          a=d.get("admob",{})
+          cfg={
+            "enabled":bool(a.get("enabled")),
+            "testing":bool(a.get("testing",True)),
+            "app_id":a.get("app_id","ca-app-pub-3940256099942544~3347511713"),
+            "banner_id":a.get("banner_id","ca-app-pub-3940256099942544/6300978111"),
+            "interstitial_id":a.get("interstitial_id","ca-app-pub-3940256099942544/1033173712"),
+            "rewarded_id":a.get("rewarded_id","ca-app-pub-3940256099942544/5224354917"),
+            "banner_enabled":bool(a.get("banner_enabled",True)),
+            "interstitial_enabled":bool(a.get("interstitial_enabled",True)),
+            "rewarded_enabled":bool(a.get("rewarded_enabled",True)),
+            "interstitial_frequency":max(1,int(a.get("interstitial_frequency",3)))
+          }
+          json.dump(cfg,open("www/admob-config.json","w"))
+          PY
+
+          if python3 -c 'import json; exit(0 if json.load(open("../manifest.json")).get("admob",{}).get("enabled") else 1)'; then
+            cat > admob-entry.js <<'JS'
+          import { AdMob } from "@capacitor-community/admob";
+
+          const c = window.APP_ADMOB_CONFIG;
+          let initialized = false;
+          let pageCount = 0;
+
+          async function init() {
+            if (!c?.enabled || initialized) return false;
+            await AdMob.initialize();
+            let consent = await AdMob.requestConsentInfo();
+            if (!consent.canRequestAds && consent.isConsentFormAvailable) {
+              consent = await AdMob.showConsentForm();
+            }
+            if (!consent.canRequestAds) return false;
+            initialized = true;
+            if (c.banner_enabled) await banner();
+            return true;
+          }
+
+          async function banner() {
+            if (!initialized || !c.banner_enabled) return;
+            await AdMob.showBanner({
+              adId:c.banner_id,
+              adSize:"ADAPTIVE_BANNER",
+              position:"BOTTOM_CENTER",
+              isTesting:c.testing
+            });
+          }
+
+          async function interstitial() {
+            if (!initialized || !c.interstitial_enabled) return false;
+            pageCount++;
+            if (pageCount % c.interstitial_frequency !== 0) return false;
+            await AdMob.prepareInterstitial({
+              adId:c.interstitial_id,
+              isTesting:c.testing
+            });
+            await AdMob.showInterstitial();
+            return true;
+          }
+
+          async function rewarded() {
+            if (!initialized || !c.rewarded_enabled) {
+              throw new Error("Rewarded ads are not enabled or consent is unavailable");
+            }
+            await AdMob.prepareRewardVideoAd({
+              adId:c.rewarded_id,
+              isTesting:c.testing
+            });
+            const result = await AdMob.showRewardVideoAd();
+            window.dispatchEvent(new CustomEvent("builder:reward-earned", {
+              detail:result
+            }));
+            return result;
+          }
+
+          window.BuilderAdMob = {
+            initialize:init,
+            showBanner:banner,
+            showInterstitial:interstitial,
+            showRewarded:rewarded,
+            hideBanner:()=>AdMob.hideBanner(),
+            removeBanner:()=>AdMob.removeBanner(),
+            showPrivacyOptions:()=>AdMob.showPrivacyOptionsForm()
+          };
+
+          if (c?.enabled) {
+            document.addEventListener("DOMContentLoaded",()=>{
+              init().catch(e=>console.error("AdMob init:",e));
+            });
+          }
+          JS
+
+            npx --yes esbuild admob-entry.js \
+              --bundle --platform=browser --format=iife \
+              --outfile=www/admob-runtime.js
+
+            python3 - <<'PY'
+          import json
+          d=json.load(open("../manifest.json"))
+          a=d.get("admob",{})
+          if not a.get("enabled"): raise SystemExit(0)
+
+          p="www/index.html"
+          s=open(p,encoding="utf-8").read()
+          tag='<script src="./admob-runtime.js"></script>'
+          if "admob-runtime.js" not in s:
+              pos=s.lower().rfind("</body>")
+              s=s[:pos]+tag+s[pos:] if pos>=0 else s+tag
+          open(p,"w",encoding="utf-8").write(s)
+          PY
+          fi
+
+      - name: Add Android platform
+        if: steps.detect.outputs.type == 'web'
+        run: |
+          cd project
           npx cap add android
           npx cap sync android
 
+      - name: Configure AdMob Android App ID
+        if: steps.detect.outputs.type == 'web'
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+
+          d=json.load(open("manifest.json"))
+          a=d.get("admob",{})
+          if not a.get("enabled"):
+              print("AdMob disabled; skipping native app ID")
+              raise SystemExit(0)
+
+          app_id=a.get("app_id") or "ca-app-pub-3940256099942544~3347511713"
+          if not re.fullmatch(r"ca-app-pub-[0-9]+~[0-9]+",app_id):
+              raise SystemExit("Invalid AdMob App ID")
+
+          root=Path("project/android/app/src/main")
+          manifest=root/"AndroidManifest.xml"
+          xml=manifest.read_text()
+          meta='<meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" android:value="@string/admob_app_id" />'
+
+          if "com.google.android.gms.ads.APPLICATION_ID" not in xml:
+              xml=re.sub(r"(<application\b[^>]*>)",r"\1\n        "+meta,xml,count=1)
+          manifest.write_text(xml)
+
+          values=root/"res/values"
+          values.mkdir(parents=True,exist_ok=True)
+          strings=values/"strings.xml"
+
+          if strings.exists():
+              content=strings.read_text()
+          else:
+              content='<?xml version="1.0" encoding="utf-8"?><resources></resources>'
+
+          item=f'<string name="admob_app_id">{app_id}</string>'
+          if 'name="admob_app_id"' in content:
+              content=re.sub(r'<string name="admob_app_id">.*?</string>',item,content)
+          else:
+              content=content.replace("</resources>",item+"</resources>")
+          strings.write_text(content)
+          print("AdMob Android App ID configured")
+          PY
+
       - name: Locate Android project
         id: android
-        shell: bash
         run: |
-          set -euo pipefail
-
           if [ "${{ steps.detect.outputs.type }}" = "native" ]; then
-            GRADLE="$(find project -name gradlew -type f \
+            G="$(find project -name gradlew -type f \
               -not -path '*/node_modules/*' | head -n 1)"
-
-            ANDROID_DIR="$(dirname "$GRADLE")"
+            D="$(dirname "$G")"
           else
-            ANDROID_DIR="project/android"
+            D="project/android"
           fi
+          test -f "$D/gradlew"
+          chmod +x "$D/gradlew"
+          echo "dir=$D" >> "$GITHUB_OUTPUT"
 
-          test -f "$ANDROID_DIR/gradlew"
-
-          echo "dir=$ANDROID_DIR" >> "$GITHUB_OUTPUT"
-
-          chmod +x "$ANDROID_DIR/gradlew"
-
-      - name: Build debug APK
-        shell: bash
+      - name: Build Debug APK
         run: |
-          set -euo pipefail
-
           cd "${{ steps.android.outputs.dir }}"
-
           ./gradlew --no-daemon assembleDebug
 
-      - name: Find and prepare APK
-        shell: bash
+      - name: Collect APK
         run: |
           set -euo pipefail
-
           APK="$(find project -type f \
-            -path '*/build/outputs/apk/*/*.apk' \
-            | head -n 1)"
-
-          if [ -z "$APK" ]; then
-            echo "APK output not found."
-            exit 1
-          fi
-
+            -path '*/build/outputs/apk/*/*.apk' | head -n 1)"
+          test -n "$APK"
           cp "$APK" output/app-debug.apk
-
           test -s output/app-debug.apk
-
-          echo "APK created successfully."
           ls -lh output/app-debug.apk
 
-      - name: Upload APK to GitHub Release
-        shell: bash
+      - name: Upload APK
         run: |
-          set -euo pipefail
+          gh release upload "$RELEASE_TAG" output/app-debug.apk \
+            --repo "$GH_REPO" --clobber
 
-          gh release upload "$RELEASE_TAG" \
-            output/app-debug.apk \
-            --repo "$GH_REPO" \
-            --clobber
-
-      - name: Remove temporary source ZIP
+      - name: Delete source ZIP
         if: success()
         continue-on-error: true
-        shell: bash
         run: |
           gh release delete-asset "$RELEASE_TAG" source.zip \
-            --repo "$GH_REPO" \
-            --yes
+            --repo "$GH_REPO" --yes
 
-      - name: Publish completed release
-        shell: bash
+      - name: Publish Release
         run: |
-          set -euo pipefail
-
           gh release edit "$RELEASE_TAG" \
             --repo "$GH_REPO" \
             --draft=false \
             --prerelease=false
 
-      - name: Build summary
-        if: success()
-        shell: bash
+      - name: Summary
+        if: always()
         run: |
           {
-            echo "## APK Build Successful"
-            echo ""
+            echo "## Advanced APK Builder"
+            echo "- Build ID: $RUN_ID"
             echo "- App: $APP_NAME"
             echo "- Package: $PACKAGE_ID"
             echo "- Version: $APP_VERSION"
-            echo "- Build ID: $RUN_ID"
-            echo "- APK: app-debug.apk"
-            echo ""
-            echo "The APK is attached to the GitHub Release."
+            echo "- Debug APK build step status: ${{ job.status }}"
           } >> "$GITHUB_STEP_SUMMARY"
