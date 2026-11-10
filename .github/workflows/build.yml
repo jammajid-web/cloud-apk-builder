@@ -1,4 +1,3 @@
-
 name: Advanced Cloud APK Builder
 
 run-name: APK Builder - ${{ inputs.run_id }}
@@ -11,7 +10,7 @@ on:
         required: true
         type: string
       release_tag:
-        description: GitHub draft release tag
+        description: Draft GitHub Release tag
         required: true
         type: string
       manifest_json:
@@ -37,11 +36,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate configuration
+      - name: Validate manifest
         id: config
         env:
           MANIFEST_JSON: ${{ inputs.manifest_json }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           python3 - <<'PY'
           import json, os, re, sys
@@ -51,41 +49,42 @@ jobs:
           except Exception as e:
               sys.exit("Invalid manifest JSON: " + str(e))
 
-          def get(*keys, default=""):
-              for key in keys:
-                  if m.get(key) not in (None, ""):
-                      return m[key]
-              return default
-
-          name = str(get("app_name", "APP_NAME")).strip()
-          package = str(get("package_id", "PACKAGE_ID")).strip()
-          version = str(get("version", "APP_VERSION", default="1.0.0")).strip()
-          code = str(get("version_code", "VERSION_CODE", default="1")).strip()
+          name = str(m.get("app_name", "")).strip()
+          package = str(m.get("package_id", "")).strip()
+          version = str(m.get("version", "")).strip()
+          code = m.get("version_code")
 
           if not name or len(name) > 80:
-              sys.exit("Invalid app name.")
-
+              sys.exit("App name is required (maximum 80 characters).")
           if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+", package):
               sys.exit("Invalid Android package ID.")
-
-          if not re.fullmatch(r"[A-Za-z0-9._+-]+", version):
-              sys.exit("Invalid version name.")
-
-          if not code.isdigit() or int(code) < 1:
-              sys.exit("Invalid version code.")
+          if not version or not re.fullmatch(r"[A-Za-z0-9._+-]+", version):
+              sys.exit("Invalid app version.")
+          if not isinstance(code, int) or isinstance(code, bool) or code < 1:
+              sys.exit("Version code must be a positive integer.")
 
           backend = m.get("backend") or {}
           provider = backend.get("provider", "none")
-
           if provider not in ("none", "supabase", "firebase"):
               sys.exit("Unsupported backend provider.")
+
+          admob = m.get("admob") or {}
+          branding = m.get("branding") or {}
+
+          for key in ("primary_color", "secondary_color", "splash_background"):
+              value = branding.get(key, "#ffffff")
+              if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(value)):
+                  sys.exit("Invalid branding color: " + key)
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("app_name=" + name.replace("%", "%25").replace("\n", "%0A") + "\n")
               f.write("package_id=" + package + "\n")
               f.write("version=" + version + "\n")
-              f.write("version_code=" + code + "\n")
+              f.write("version_code=" + str(code) + "\n")
               f.write("backend=" + provider + "\n")
+              f.write("admob_enabled=" + str(bool(admob.get("enabled"))).lower() + "\n")
+              f.write("splash_duration=" + str(max(0, min(10000, int(branding.get("splash_duration", 2500) or 0)))) + "\n")
+              f.write("splash_background=" + str(branding.get("splash_background", "#ffffff")) + "\n")
           PY
 
       - name: Set up Java 17
@@ -103,331 +102,354 @@ jobs:
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
-      - name: Download project ZIP from GitHub Release
+      - name: Download source ZIP from draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.release_tag }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-
           RELEASE=$(curl -fsSL \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$REPO/releases/tags/$TAG")
-
-          RELEASE_ID=$(echo "$RELEASE" | jq -r '.id')
-          ASSET_ID=$(echo "$RELEASE" | jq -r '.assets[] | select(.name=="source.zip") | .id')
-
-          if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" = "null" ] || [ -z "$ASSET_ID" ]; then
-            echo "Source ZIP was not found in the draft release."
+          ASSET_ID=$(echo "$RELEASE" | jq -r '.assets[] | select(.name=="source.zip") | .id' | head -n 1)
+          if [ -z "$ASSET_ID" ] || [ "$ASSET_ID" = "null" ]; then
+            echo "source.zip not found in draft release."
             exit 1
           fi
-
           curl -fL \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/octet-stream" \
             "https://api.github.com/repos/$REPO/releases/assets/$ASSET_ID" \
             -o source.zip
-
           test -s source.zip
 
-      - name: Safely extract project ZIP
+      - name: Safely extract source ZIP
         run: |
           python3 - <<'PY'
-          import zipfile, os, shutil, sys
+          import zipfile, os, shutil, stat, sys
 
-          archive = "source.zip"
-          destination = "source"
-
-          shutil.rmtree(destination, ignore_errors=True)
-          os.makedirs(destination, exist_ok=True)
-
-          max_total = 400 * 1024 * 1024
+          target = "source"
+          shutil.rmtree(target, ignore_errors=True)
+          os.makedirs(target, exist_ok=True)
           total = 0
+          limit = 400 * 1024 * 1024
 
-          with zipfile.ZipFile(archive) as z:
+          with zipfile.ZipFile("source.zip") as z:
               for item in z.infolist():
                   name = item.filename.replace("\\", "/")
                   parts = name.split("/")
+                  mode = (item.external_attr >> 16) & 0xFFFF
 
                   if name.startswith("/") or ".." in parts:
-                      sys.exit("Unsafe ZIP path detected.")
-
-                  if item.external_attr >> 28 == 0xA:
+                      sys.exit("Unsafe ZIP path found.")
+                  if stat.S_ISLNK(mode):
                       sys.exit("Symbolic links are not allowed.")
-
                   total += item.file_size
-                  if total > max_total:
-                      sys.exit("Extracted project exceeds 400 MB.")
+                  if total > limit:
+                      sys.exit("Extracted ZIP exceeds 400 MB.")
+              z.extractall(target)
 
-              z.extractall(destination)
-
-          print("Project extracted safely.")
+          print("Source ZIP extracted.")
           PY
 
       - name: Detect project type
         id: project
         run: |
           set -euo pipefail
-
-          ROOT="source"
-
-          if [ -f "$ROOT/gradlew" ]; then
+          GRADLE=$(find source -maxdepth 5 -type f -name gradlew | head -n 1 || true)
+          if [ -n "$GRADLE" ]; then
+            ROOT=$(dirname "$GRADLE")
             echo "type=native" >> "$GITHUB_OUTPUT"
             echo "root=$ROOT" >> "$GITHUB_OUTPUT"
           else
-            INDEX=$(find "$ROOT" -maxdepth 4 -type f -name index.html | head -n 1)
-
+            INDEX=$(find source -maxdepth 5 -type f -name index.html | head -n 1 || true)
             if [ -z "$INDEX" ]; then
-              echo "No index.html or native Gradle project was found."
+              echo "No index.html or Gradle Android project found."
               exit 1
             fi
-
-            WEB_ROOT=$(dirname "$INDEX")
             echo "type=web" >> "$GITHUB_OUTPUT"
-            echo "root=$WEB_ROOT" >> "$GITHUB_OUTPUT"
+            echo "root=$(dirname "$INDEX")" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Prepare Capacitor web project
+      - name: Prepare Capacitor project
         if: steps.project.outputs.type == 'web'
         env:
           APP_NAME: ${{ steps.config.outputs.app_name }}
           PACKAGE_ID: ${{ steps.config.outputs.package_id }}
-          APP_VERSION: ${{ steps.config.outputs.version }}
-          VERSION_CODE: ${{ steps.config.outputs.version_code }}
-          MANIFEST_JSON: ${{ inputs.manifest_json }}
+          SPLASH_BG: ${{ steps.config.outputs.splash_background }}
         run: |
           set -euo pipefail
-
           mkdir -p project/www
           cp -R "${{ steps.project.outputs.root }}/." project/www/
-
           cd project
-
           npm init -y
           npm install @capacitor/core@6 @capacitor/android@6
           npm install --save-dev @capacitor/cli@6
-
-          python3 - <<'PY'
-          import json, os
-
-          config = {
-              "appId": os.environ["PACKAGE_ID"],
-              "appName": os.environ["APP_NAME"],
-              "webDir": "www",
-              "plugins": {
-                  "SplashScreen": {
-                      "launchShowDuration": 2500,
-                      "launchAutoHide": True,
-                      "backgroundColor": "#ffffff",
-                      "showSpinner": False,
-                      "androidScaleType": "CENTER_INSIDE"
-                  }
+          cat > capacitor.config.json <<EOF
+          {
+            "appId": "$PACKAGE_ID",
+            "appName": $(python3 -c 'import json,os; print(json.dumps(os.environ["APP_NAME"]))'),
+            "webDir": "www",
+            "plugins": {
+              "SplashScreen": {
+                "launchShowDuration": ${{ steps.config.outputs.splash_duration }},
+                "launchAutoHide": true,
+                "backgroundColor": "$SPLASH_BG",
+                "showSpinner": false,
+                "androidScaleType": "CENTER_INSIDE"
               }
+            }
           }
-
-          with open("capacitor.config.json", "w") as f:
-              json.dump(config, f, indent=2)
-          PY
-
+          EOF
           npx cap add android
 
-      - name: Install AdMob plugin
+      - name: Install backend and AdMob packages
         if: steps.project.outputs.type == 'web'
         env:
           MANIFEST_JSON: ${{ inputs.manifest_json }}
+        working-directory: project
         run: |
+          set -euo pipefail
           python3 - <<'PY'
           import json, os
           m = json.loads(os.environ["MANIFEST_JSON"])
-          admob = m.get("admob") or {}
-          enabled = str(admob.get("enabled", False)).lower() in ("true", "1", "yes")
+          backend = (m.get("backend") or {}).get("provider", "none")
+          admob = bool((m.get("admob") or {}).get("enabled"))
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write("enabled=" + str(enabled).lower() + "\n")
+              f.write("backend=" + backend + "\n")
+              f.write("admob=" + str(admob).lower() + "\n")
           PY
-        id: admob
+        id: packages
 
-      - name: Add AdMob Capacitor dependency
-        if: steps.project.outputs.type == 'web' && steps.admob.outputs.enabled == 'true'
+      - name: Install Supabase SDK
+        if: steps.project.outputs.type == 'web' && steps.packages.outputs.backend == 'supabase'
+        working-directory: project
+        run: npm install @supabase/supabase-js@2
+
+      - name: Install Firebase SDK
+        if: steps.project.outputs.type == 'web' && steps.packages.outputs.backend == 'firebase'
+        working-directory: project
+        run: npm install firebase@^10
+
+      - name: Install AdMob plugin
+        if: steps.project.outputs.type == 'web' && steps.packages.outputs.admob == 'true'
         working-directory: project
         run: npm install @capacitor-community/admob@6
 
-      - name: Configure backend and AdMob runtime
+      - name: Create backend and AdMob runtimes
         if: steps.project.outputs.type == 'web'
         env:
           MANIFEST_JSON: ${{ inputs.manifest_json }}
         working-directory: project
         run: |
+          set -euo pipefail
           python3 - <<'PY'
           import json, os, pathlib
 
           m = json.loads(os.environ["MANIFEST_JSON"])
           backend = m.get("backend") or {}
           provider = backend.get("provider", "none")
-
-          config = {
-              "provider": provider,
-              "supabase": backend.get("supabase", {}),
-              "firebase": backend.get("firebase", {})
-          }
-
+          admob = m.get("admob") or {}
           www = pathlib.Path("www")
           www.mkdir(exist_ok=True)
 
-          config_js = (
-              "window.APP_BACKEND_CONFIG = "
-              + json.dumps(config, separators=(",", ":"))
-              + ";"
-          )
-
-          (www / "builder-backend-config.js").write_text(config_js)
-
-          backend_runtime = r"""
-          (() => {
-            const cfg = window.APP_BACKEND_CONFIG || {};
-            window.BuilderBackend = {
-              config: cfg,
-              provider: cfg.provider || "none",
-              ready: true
-            };
-          })();
+          if provider == "supabase":
+              cfg = backend.get("supabase") or {}
+              if not cfg.get("url") or not (cfg.get("publishable_key") or cfg.get("anon_key")):
+                  raise SystemExit("Supabase URL and public client key are required.")
+              source = """
+          import { createClient } from '@supabase/supabase-js';
+          const cfg = __BACKEND_CONFIG__;
+          const s = cfg.supabase || {};
+          const client = createClient(s.url, s.publishable_key || s.anon_key);
+          window.BuilderBackend = {
+            provider: 'supabase',
+            supabase: client,
+            features: s.features || {}
+          };
           """
-
-          admob = m.get("admob") or {}
-          enabled = str(admob.get("enabled", False)).lower() in ("true", "1", "yes")
-
-          if enabled:
-            test_mode = str(admob.get("test_mode", True)).lower() in ("true", "1", "yes")
-
-            ids = {
-              "appId": admob.get("app_id", ""),
-              "banner": admob.get("banner_id", ""),
-              "interstitial": admob.get("interstitial_id", ""),
-              "rewarded": admob.get("rewarded_id", ""),
-              "testMode": test_mode,
-              "frequency": int(admob.get("frequency", 3) or 3)
-            }
-
-            if test_mode:
-              ids["appId"] = ids["appId"] or "ca-app-pub-3940256099942544~3347511713"
-              ids["banner"] = ids["banner"] or "ca-app-pub-3940256099942544/6300978111"
-              ids["interstitial"] = ids["interstitial"] or "ca-app-pub-3940256099942544/1033173712"
-              ids["rewarded"] = ids["rewarded"] or "ca-app-pub-3940256099942544/5224354917"
-
-            admob_config = "window.BUILDER_ADMOB = " + json.dumps(ids) + ";"
-
-            admob_runtime = r"""
-            (() => {
-              const cfg = window.BUILDER_ADMOB || {};
-              let adCount = 0;
-
-              async function startAds() {
-                if (!window.Capacitor || !window.Capacitor.isNativePlatform?.()) return;
-
-                const AdMob = window.Capacitor.Plugins?.AdMob;
-                if (!AdMob) {
-                  console.warn("AdMob native plugin bridge not found.");
-                  return;
-                }
-
-                try {
-                  await AdMob.initialize({
-                    requestTrackingAuthorization: true,
-                    initializeForTesting: cfg.testMode
-                  });
-
-                  try {
-                    const consent = await AdMob.requestConsentInfo();
-
-                    if (consent?.isConsentFormAvailable &&
-                        consent?.status === "REQUIRED") {
-                      await AdMob.showConsentForm();
-                    }
-                  } catch (consentError) {
-                    console.warn("AdMob consent flow:", consentError);
-                  }
-
-                  if (cfg.banner) {
-                    await AdMob.showBanner({
-                      adId: cfg.banner,
-                      adSize: "ADAPTIVE_BANNER",
-                      position: "BOTTOM_CENTER",
-                      isTesting: !!cfg.testMode
-                    });
-                  }
-
-                  window.BuilderShowInterstitial = async () => {
-                    if (!cfg.interstitial) return;
-                    try {
-                      await AdMob.prepareInterstitial({
-                        adId: cfg.interstitial,
-                        isTesting: !!cfg.testMode
-                      });
-                      await AdMob.showInterstitial();
-                    } catch (e) {
-                      console.warn("Interstitial:", e);
-                    }
-                  };
-
-                  window.BuilderShowRewarded = async () => {
-                    if (!cfg.rewarded) return null;
-                    try {
-                      await AdMob.prepareRewardVideoAd({
-                        adId: cfg.rewarded,
-                        isTesting: !!cfg.testMode
-                      });
-                      return await AdMob.showRewardVideoAd();
-                    } catch (e) {
-                      console.warn("Rewarded ad:", e);
-                      return null;
-                    }
-                  };
-
-                  console.log("AdMob initialization completed.");
-                } catch (e) {
-                  console.error("AdMob initialization failed:", e);
-                }
-              }
-
-              document.addEventListener("DOMContentLoaded", startAds);
-              window.addEventListener("builder-interstitial", () => {
-                adCount++;
-                if (cfg.frequency > 0 && adCount % cfg.frequency === 0) {
-                  window.BuilderShowInterstitial?.();
-                }
-              });
-            })();
-            """
-
-            (www / "builder-admob-config.js").write_text(admob_config)
-            (www / "builder-admob-runtime.js").write_text(admob_runtime)
-
-          html_files = list(www.rglob("*.html"))
-
-          for file in html_files:
-            html = file.read_text(errors="ignore")
-            scripts = '<script src="builder-backend-config.js"></script>'
-
-            if enabled:
-              scripts += (
-                '<script src="builder-admob-config.js"></script>'
-                '<script src="builder-admob-runtime.js"></script>'
+              config = {"supabase": cfg}
+              (pathlib.Path("backend-runtime.js")).write_text(
+                  source.replace("__BACKEND_CONFIG__", json.dumps(config))
               )
 
-            if "builder-backend-config.js" not in html:
-              if "</body>" in html.lower():
-                pos = html.lower().rfind("</body>")
-                html = html[:pos] + scripts + html[pos:]
-              else:
-                html += scripts
+          elif provider == "firebase":
+              cfg = backend.get("firebase") or {}
+              firebase_config = cfg.get("config") or {}
+              if not firebase_config.get("apiKey") or not firebase_config.get("projectId") or not firebase_config.get("appId"):
+                  raise SystemExit("Firebase Web config requires apiKey, projectId and appId.")
+              source = """
+          import { initializeApp, getApps } from 'firebase/app';
+          import { getAuth } from 'firebase/auth';
+          import { getFirestore } from 'firebase/firestore';
+          import { getStorage } from 'firebase/storage';
+          const cfg = __FIREBASE_CONFIG__;
+          const app = getApps().length ? getApps()[0] : initializeApp(cfg);
+          window.BuilderBackend = {
+            provider: 'firebase',
+            app,
+            auth: getAuth(app),
+            firestore: getFirestore(app),
+            storage: getStorage(app),
+            features: __FIREBASE_FEATURES__
+          };
+          """
+              source = source.replace("__FIREBASE_CONFIG__", json.dumps(firebase_config))
+              source = source.replace("__FIREBASE_FEATURES__", json.dumps(cfg.get("features") or {}))
+              (pathlib.Path("backend-runtime.js")).write_text(source)
 
-              file.write_text(html)
+          if admob.get("enabled"):
+              test_mode = bool(admob.get("test_mode", True))
+              app_id = admob.get("app_id", "").strip()
+              banner = admob.get("banner_id", "").strip()
+              interstitial = admob.get("interstitial_id", "").strip()
+              rewarded = admob.get("rewarded_id", "").strip()
 
-          print("Backend and optional AdMob runtime prepared.")
+              if test_mode:
+                  app_id = app_id or "ca-app-pub-3940256099942544~3347511713"
+                  banner = banner or "ca-app-pub-3940256099942544/6300978111"
+                  interstitial = interstitial or "ca-app-pub-3940256099942544/1033173712"
+                  rewarded = rewarded or "ca-app-pub-3940256099942544/5224354917"
+              elif not app_id:
+                  raise SystemExit("Live AdMob requires an AdMob App ID.")
+
+              if not any((banner, interstitial, rewarded)):
+                  raise SystemExit("Enable at least one AdMob ad unit.")
+
+              source = """
+          import { Capacitor } from '@capacitor/core';
+          import {
+            AdMob, BannerAdSize, BannerAdPosition, AdmobConsentStatus
+          } from '@capacitor-community/admob';
+
+          const cfg = __ADMOB_CONFIG__;
+          let interstitialCount = 0;
+          let initialized = false;
+
+          async function initializeAds() {
+            if (initialized || !Capacitor.isNativePlatform()) return;
+            initialized = true;
+            try {
+              let consentInfo = await AdMob.requestConsentInfo();
+              if (consentInfo.isConsentFormAvailable &&
+                  consentInfo.status === AdmobConsentStatus.REQUIRED) {
+                consentInfo = await AdMob.showConsentForm();
+              }
+
+              // Capacitor AdMob v6 exposes consent status, not canRequestAds.
+              if (consentInfo.status === AdmobConsentStatus.REQUIRED ||
+                  consentInfo.status === AdmobConsentStatus.UNKNOWN) {
+                console.warn('AdMob consent is not ready; ads were not requested.');
+                return;
+              }
+
+              await AdMob.initialize({
+                initializeForTesting: cfg.testMode,
+                requestTrackingAuthorization: true
+              });
+
+              if (cfg.banner) {
+                await AdMob.showBanner({
+                  adId: cfg.banner,
+                  adSize: BannerAdSize.ADAPTIVE_BANNER,
+                  position: BannerAdPosition.BOTTOM_CENTER,
+                  isTesting: cfg.testMode
+                });
+              }
+              console.log('AdMob initialized.');
+            } catch (error) {
+              console.error('AdMob initialization failed:', error);
+            }
+          }
+
+          window.BuilderShowInterstitial = async function() {
+            if (!cfg.interstitial || !Capacitor.isNativePlatform()) return;
+            try {
+              await AdMob.prepareInterstitial({
+                adId: cfg.interstitial,
+                isTesting: cfg.testMode
+              });
+              await AdMob.showInterstitial();
+            } catch (error) {
+              console.warn('Interstitial ad:', error);
+            }
+          };
+
+          window.BuilderShowRewarded = async function() {
+            if (!cfg.rewarded || !Capacitor.isNativePlatform()) return null;
+            try {
+              await AdMob.prepareRewardVideoAd({
+                adId: cfg.rewarded,
+                isTesting: cfg.testMode
+              });
+              return await AdMob.showRewardVideoAd();
+            } catch (error) {
+              console.warn('Rewarded ad:', error);
+              return null;
+            }
+          };
+
+          window.addEventListener('builder-interstitial', () => {
+            interstitialCount++;
+            if (cfg.frequency > 0 && interstitialCount % cfg.frequency === 0) {
+              window.BuilderShowInterstitial();
+            }
+          });
+
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initializeAds, { once: true });
+          } else {
+            initializeAds();
+          }
+          """
+              config = {
+                  "appId": app_id,
+                  "banner": banner,
+                  "interstitial": interstitial,
+                  "rewarded": rewarded,
+                  "testMode": test_mode,
+                  "frequency": max(0, int(admob.get("frequency", 3) or 0))
+              }
+              (pathlib.Path("admob-runtime.js")).write_text(
+                  source.replace("__ADMOB_CONFIG__", json.dumps(config))
+              )
+
+          (pathlib.Path("www") / "builder-backend-info.json").write_text(
+              json.dumps({"provider": provider})
+          )
           PY
 
-      - name: Generate app icon and splash assets
+          if [ -f backend-runtime.js ]; then
+            npx esbuild backend-runtime.js --bundle --platform=browser --format=iife --outfile=www/builder-backend-runtime.js
+          fi
+
+          if [ -f admob-runtime.js ]; then
+            npx esbuild admob-runtime.js --bundle --platform=browser --format=iife --outfile=www/builder-admob-runtime.js
+          fi
+
+          python3 - <<'PY'
+          import pathlib
+          index = pathlib.Path("www/index.html")
+          if not index.exists():
+              raise SystemExit("www/index.html is missing.")
+          html = index.read_text(errors="replace")
+          tags = ""
+          if pathlib.Path("www/builder-backend-runtime.js").exists():
+              tags += '<script src="builder-backend-runtime.js"></script>'
+          if pathlib.Path("www/builder-admob-runtime.js").exists():
+              tags += '<script src="builder-admob-runtime.js"></script>'
+          if tags:
+              if "</head>" in html.lower():
+                  pos = html.lower().rfind("</head>")
+                  html = html[:pos] + tags + html[pos:]
+              else:
+                  html = tags + html
+              index.write_text(html)
+          PY
+
+      - name: Generate original app icon and splash artwork
         if: steps.project.outputs.type == 'web'
         env:
           MANIFEST_JSON: ${{ inputs.manifest_json }}
@@ -435,193 +457,176 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m pip install --quiet pillow
-
           python3 - <<'PY'
-          import json, os, pathlib, math
+          import json, os, pathlib
           from PIL import Image, ImageDraw, ImageFont
 
           m = json.loads(os.environ["MANIFEST_JSON"])
-          branding = m.get("branding") or {}
+          b = m.get("branding") or {}
+          name = str(m.get("app_name", "My App"))[:40]
+          category = str(m.get("category", "app"))[:40]
 
-          name = str(m.get("app_name", "My App"))
-          category = str(m.get("category", "app")).strip()
-          primary = str(branding.get("primary_color", "#2457D6"))
-          secondary = str(branding.get("secondary_color", "#FFFFFF"))
-          background = str(branding.get("splash_background", secondary))
-
-          def color(value, fallback):
+          def rgb(value, default):
               try:
-                  value = value.lstrip("#")
+                  value = str(value).lstrip("#")
                   if len(value) == 6:
                       return tuple(int(value[i:i+2], 16) for i in (0, 2, 4))
               except Exception:
                   pass
-              return fallback
+              return default
 
-          primary_rgb = color(primary, (36, 87, 214))
-          secondary_rgb = color(secondary, (255, 255, 255))
-          bg_rgb = color(background, (255, 255, 255))
-
+          primary = rgb(b.get("primary_color", "#2457d6"), (36,87,214))
+          foreground = rgb(b.get("secondary_color", "#ffffff"), (255,255,255))
+          background = rgb(b.get("splash_background", "#ffffff"), (255,255,255))
           font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-          try:
-              font = ImageFont.truetype(font_path, 300)
-          except Exception:
-              font = ImageFont.load_default()
 
-          def draw_icon(size):
-              im = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+          def font(size):
+              try: return ImageFont.truetype(font_path, size)
+              except Exception: return ImageFont.load_default()
+
+          def make_icon(size):
+              im = Image.new("RGBA", (size,size), (0,0,0,0))
               d = ImageDraw.Draw(im)
-              margin = int(size * .08)
-              d.rounded_rectangle(
-                  (margin, margin, size-margin, size-margin),
-                  radius=int(size*.23),
-                  fill=primary_rgb
-              )
+              margin = int(size*.08)
+              d.rounded_rectangle((margin,margin,size-margin,size-margin),
+                                  radius=int(size*.22), fill=primary)
               letter = (name[:1] or "A").upper()
-              f = ImageFont.truetype(font_path, int(size*.48))
-              box = d.textbbox((0, 0), letter, font=f)
-              x = (size - (box[2]-box[0])) / 2
-              y = (size - (box[3]-box[1])) / 2 - box[1]
-              d.text((x, y), letter, fill=secondary_rgb, font=f)
+              f = font(int(size*.48))
+              box = d.textbbox((0,0), letter, font=f)
+              x = (size-(box[2]-box[0]))/2
+              y = (size-(box[3]-box[1]))/2-box[1]
+              d.text((x,y), letter, fill=foreground, font=f)
               return im
 
-          icon = draw_icon(1024)
-          icon.save("builder-icon.png")
+          make_icon(1024).save("builder-icon.png")
 
-          splash = Image.new("RGB", (1600, 2400), bg_rgb)
-          d = ImageDraw.Draw(splash)
-          logo = draw_icon(600)
-          splash.paste(logo, (500, 700), logo)
-
-          try:
-              title_font = ImageFont.truetype(font_path, 76)
-              small_font = ImageFont.truetype(font_path, 34)
-          except Exception:
-              title_font = ImageFont.load_default()
-              small_font = ImageFont.load_default()
-
-          def centered(text, y, font, fill):
-              box = d.textbbox((0, 0), text, font=font)
-              x = (1600 - (box[2]-box[0])) / 2
-              d.text((x, y), text, font=font, fill=fill)
-
-          centered(name[:40], 1370, title_font, primary_rgb)
-          centered(category[:50], 1480, small_font, primary_rgb)
+          splash = Image.new("RGB", (1600,2400), background)
+          logo = make_icon(600)
+          splash.paste(logo, (500,650), logo)
+          draw = ImageDraw.Draw(splash)
+          for text, y, size in ((name,1320,72),(category,1430,34)):
+              f = font(size)
+              box = draw.textbbox((0,0), text, font=f)
+              draw.text(((1600-(box[2]-box[0]))/2,y), text, font=f, fill=primary)
           splash.save("builder-splash.png")
 
           res = pathlib.Path("android/app/src/main/res")
-
-          sizes = {
-              "mdpi": 48,
-              "hdpi": 72,
-              "xhdpi": 96,
-              "xxhdpi": 144,
-              "xxxhdpi": 192
-          }
-
-          for density, size in sizes.items():
+          density_sizes = {"mdpi":48,"hdpi":72,"xhdpi":96,"xxhdpi":144,"xxxhdpi":192}
+          for density,size in density_sizes.items():
               folder = res / ("mipmap-" + density)
               folder.mkdir(parents=True, exist_ok=True)
-              draw_icon(size).save(folder / "ic_launcher.png")
-              draw_icon(size).save(folder / "ic_launcher_round.png")
+              make_icon(size).save(folder / "ic_launcher.png")
+              make_icon(size).save(folder / "ic_launcher_round.png")
 
-          # Adaptive icon foreground with transparent background.
-          foreground = Image.new("RGBA", (432, 432), (0, 0, 0, 0))
-          mark = draw_icon(300)
-          foreground.paste(mark, (66, 66), mark)
-          folder = res / "mipmap-xxxhdpi"
-          foreground.save(folder / "ic_launcher_foreground.png")
+          fg = Image.new("RGBA",(432,432),(0,0,0,0))
+          mark = make_icon(300)
+          fg.paste(mark,(66,66),mark)
+          (res/"mipmap-xxxhdpi").mkdir(parents=True,exist_ok=True)
+          fg.save(res/"mipmap-xxxhdpi"/"ic_launcher_foreground.png")
 
-          anydpi = res / "mipmap-anydpi-v26"
-          anydpi.mkdir(parents=True, exist_ok=True)
-
+          anydpi = res/"mipmap-anydpi-v26"
+          anydpi.mkdir(parents=True,exist_ok=True)
           adaptive = '''<?xml version="1.0" encoding="utf-8"?>
-          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-            <background android:drawable="@color/ic_launcher_background"/>
-            <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
-          </adaptive-icon>'''
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android"><background android:drawable="@color/ic_launcher_background"/><foreground android:drawable="@mipmap/ic_launcher_foreground"/></adaptive-icon>'''
+          (anydpi/"ic_launcher.xml").write_text(adaptive)
+          (anydpi/"ic_launcher_round.xml").write_text(adaptive)
 
-          (anydpi / "ic_launcher.xml").write_text(adaptive)
-          (anydpi / "ic_launcher_round.xml").write_text(adaptive)
-
-          values = res / "values"
-          values.mkdir(parents=True, exist_ok=True)
-          (values / "builder_colors.xml").write_text(
+          values = res/"values"
+          values.mkdir(parents=True,exist_ok=True)
+          (values/"builder_colors.xml").write_text(
               '<?xml version="1.0" encoding="utf-8"?>'
-              '<resources><color name="ic_launcher_background">'
-              + primary + '</color></resources>'
+              '<resources><color name="ic_launcher_background">#%02x%02x%02x</color></resources>' % primary
           )
 
-          splash_dir = res / "drawable-nodpi"
-          splash_dir.mkdir(parents=True, exist_ok=True)
-          splash.save(splash_dir / "splash.png")
-
-          print("Generated original app icon and splash assets.")
+          splash_dir = res/"drawable-nodpi"
+          splash_dir.mkdir(parents=True,exist_ok=True)
+          splash.save(splash_dir/"splash.png")
           PY
 
-      - name: Sync Capacitor Android project
+      - name: Sync Capacitor Android
         if: steps.project.outputs.type == 'web'
         working-directory: project
-        run: |
-          npx cap sync android
+        run: npx cap sync android
 
-      - name: Configure Android application metadata
+      - name: Configure Android app metadata and AdMob App ID
         if: steps.project.outputs.type == 'web'
         env:
           APP_NAME: ${{ steps.config.outputs.app_name }}
           PACKAGE_ID: ${{ steps.config.outputs.package_id }}
           APP_VERSION: ${{ steps.config.outputs.version }}
           VERSION_CODE: ${{ steps.config.outputs.version_code }}
+          MANIFEST_JSON: ${{ inputs.manifest_json }}
         working-directory: project
         run: |
           python3 - <<'PY'
-          import pathlib, os, re, xml.etree.ElementTree as ET
+          import pathlib, os, re, json, xml.etree.ElementTree as ET
 
           app = pathlib.Path("android/app")
-          gradle = app / "build.gradle"
-
+          gradle = app/"build.gradle"
           if not gradle.exists():
-              raise SystemExit("Android app/build.gradle not found.")
+              raise SystemExit("Expected Android Groovy build.gradle not found.")
 
           text = gradle.read_text()
-
-          text = re.sub(
-              r'applicationId\s+["\'][^"\']+["\']',
-              'applicationId "' + os.environ["PACKAGE_ID"] + '"',
-              text
-          )
-
-          text = re.sub(
-              r'versionCode\s+\d+',
-              'versionCode ' + os.environ["VERSION_CODE"],
-              text
-          )
-
-          text = re.sub(
-              r'versionName\s+["\'][^"\']+["\']',
-              'versionName "' + os.environ["APP_VERSION"] + '"',
-              text
-          )
-
+          replacements = [
+              (r'applicationId\s+["\'][^"\']+["\']', 'applicationId "'+os.environ["PACKAGE_ID"]+'"'),
+              (r'versionCode\s+\d+', 'versionCode '+os.environ["VERSION_CODE"]),
+              (r'versionName\s+["\'][^"\']+["\']', 'versionName "'+os.environ["APP_VERSION"]+'"')
+          ]
+          for pattern, replacement in replacements:
+              if re.search(pattern,text):
+                  text = re.sub(pattern,replacement,text,count=1)
           gradle.write_text(text)
 
-          strings = app / "src/main/res/values/strings.xml"
+          ns = "{http://schemas.android.com/apk/res/android}"
+          strings = app/"src/main/res/values/strings.xml"
+          strings.parent.mkdir(parents=True,exist_ok=True)
           if strings.exists():
-              tree = ET.parse(strings)
-              root = tree.getroot()
-              found = False
+              tree = ET.parse(strings); root = tree.getroot()
+          else:
+              root = ET.Element("resources"); tree = ET.ElementTree(root)
 
-              for item in root.findall("string"):
-                  if item.attrib.get("name") == "app_name":
-                      item.text = os.environ["APP_NAME"]
-                      found = True
+          def put_string(key,value):
+              node = root.find("string[@name='"+key+"']")
+              if node is None: node = ET.SubElement(root,"string",{"name":key})
+              node.text = value
 
-              if not found:
-                  ET.SubElement(root, "string", {"name": "app_name"}).text = os.environ["APP_NAME"]
+          put_string("app_name",os.environ["APP_NAME"])
 
-              tree.write(strings, encoding="utf-8", xml_declaration=True)
+          m = json.loads(os.environ["MANIFEST_JSON"])
+          admob = m.get("admob") or {}
+          if admob.get("enabled"):
+              app_id = str(admob.get("app_id") or "").strip()
+              if admob.get("test_mode",True):
+                  app_id = app_id or "ca-app-pub-3940256099942544~3347511713"
+              if not app_id:
+                  raise SystemExit("AdMob App ID is required in live mode.")
+              put_string("admob_app_id",app_id)
 
-          print("Android app metadata configured.")
+          tree.write(strings,encoding="utf-8",xml_declaration=True)
+
+          manifest_path = app/"src/main/AndroidManifest.xml"
+          tree = ET.parse(manifest_path)
+          root = tree.getroot()
+          application = root.find("application")
+          if application is None:
+              raise SystemExit("AndroidManifest.xml has no application element.")
+
+          app_label = application.get(ns+"label")
+          if not app_label:
+              application.set(ns+"label","@string/app_name")
+
+          if admob.get("enabled"):
+              existing = None
+              for item in application.findall("meta-data"):
+                  if item.get(ns+"name") == "com.google.android.gms.ads.APPLICATION_ID":
+                      existing = item
+                      break
+              if existing is None:
+                  existing = ET.SubElement(application,"meta-data")
+              existing.set(ns+"name","com.google.android.gms.ads.APPLICATION_ID")
+              existing.set(ns+"value","@string/admob_app_id")
+
+          tree.write(manifest_path,encoding="utf-8",xml_declaration=True)
           PY
 
       - name: Prepare native Android project
@@ -631,11 +636,9 @@ jobs:
           cp -R "${{ steps.project.outputs.root }}/." native-project/
           chmod +x native-project/gradlew
 
-      - name: Build Android APK
-        id: build
+      - name: Build debug APK
         run: |
           set -euo pipefail
-
           if [ "${{ steps.project.outputs.type }}" = "web" ]; then
             cd project/android
           else
@@ -645,8 +648,7 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
 
-          APK=$(find app/build/outputs/apk -type f -name '*.apk' | head -n 1)
-
+          APK=$(find . -type f -path '*/outputs/apk/*' -name '*.apk' | head -n 1)
           if [ -z "$APK" ]; then
             echo "APK output not found."
             exit 1
@@ -654,8 +656,26 @@ jobs:
 
           mkdir -p "$GITHUB_WORKSPACE/output"
           cp "$APK" "$GITHUB_WORKSPACE/output/app-debug.apk"
+          test -s "$GITHUB_WORKSPACE/output/app-debug.apk"
 
-          echo "APK created successfully."
+      - name: Remove source ZIP from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          RELEASE=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/releases/tags/$TAG")
+          ASSET_ID=$(echo "$RELEASE" | jq -r '.assets[] | select(.name=="source.zip") | .id' | head -n 1)
+          if [ -n "$ASSET_ID" ] && [ "$ASSET_ID" != "null" ]; then
+            curl -fsSL -X DELETE \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/releases/assets/$ASSET_ID"
+          fi
 
       - name: Upload APK to GitHub Release
         env:
@@ -664,14 +684,11 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-
           RELEASE=$(curl -fsSL \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$REPO/releases/tags/$TAG")
-
           RELEASE_ID=$(echo "$RELEASE" | jq -r '.id')
-
           curl -fL -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
@@ -679,21 +696,18 @@ jobs:
             --data-binary "@output/app-debug.apk" \
             "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=app-debug.apk"
 
-      - name: Publish APK Release
+      - name: Publish APK release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.release_tag }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-
           RELEASE=$(curl -fsSL \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$REPO/releases/tags/$TAG")
-
           RELEASE_ID=$(echo "$RELEASE" | jq -r '.id')
-
           curl -fsSL -X PATCH \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
@@ -704,13 +718,13 @@ jobs:
       - name: Build summary
         if: success()
         run: |
-          echo "## APK Build Successful" >> "$GITHUB_STEP_SUMMARY"
+          echo "## APK build successful" >> "$GITHUB_STEP_SUMMARY"
           echo "- Request ID: ${{ inputs.run_id }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Release: ${{ inputs.release_tag }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- APK: app-debug.apk" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Build failure summary
+      - name: Failure summary
         if: failure()
         run: |
-          echo "## APK Build Failed" >> "$GITHUB_STEP_SUMMARY"
-          echo "Check the failed step above for the exact error." >> "$GITHUB_STEP_SUMMARY"
+          echo "## APK build failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Open the failed step above to inspect the error." >> "$GITHUB_STEP_SUMMARY"
