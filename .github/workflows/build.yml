@@ -104,6 +104,8 @@ jobs:
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
+      # IMPORTANT: Draft releases are fetched through the releases list API.
+      # The /releases/tags/{tag} endpoint may return 404 for draft releases.
       - name: Download source ZIP from draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -111,20 +113,35 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          RELEASE=$(curl -fsSL \
+
+          RELEASES=$(curl -fsSL \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/releases/tags/$TAG")
-          ASSET_ID=$(echo "$RELEASE" | jq -r '.assets[] | select(.name=="source.zip") | .id' | head -n 1)
-          if [ -z "$ASSET_ID" ] || [ "$ASSET_ID" = "null" ]; then
-            echo "source.zip not found in draft release."
+            "https://api.github.com/repos/$REPO/releases?per_page=100")
+
+          RELEASE=$(echo "$RELEASES" | jq -c \
+            --arg tag "$TAG" \
+            '[.[] | select(.tag_name == $tag)][0] // empty')
+
+          if [ -z "$RELEASE" ]; then
+            echo "Draft release not found: $TAG"
             exit 1
           fi
+
+          ASSET_ID=$(echo "$RELEASE" | jq -r \
+            '.assets[] | select(.name=="source.zip") | .id' | head -n 1)
+
+          if [ -z "$ASSET_ID" ] || [ "$ASSET_ID" = "null" ]; then
+            echo "source.zip not found in release."
+            exit 1
+          fi
+
           curl -fL \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/octet-stream" \
             "https://api.github.com/repos/$REPO/releases/assets/$ASSET_ID" \
             -o source.zip
+
           test -s source.zip
 
       - name: Safely extract source ZIP
@@ -151,6 +168,7 @@ jobs:
                   total += item.file_size
                   if total > limit:
                       sys.exit("Extracted ZIP exceeds 400 MB.")
+
               z.extractall(target)
 
           print("Source ZIP extracted.")
@@ -160,17 +178,21 @@ jobs:
         id: project
         run: |
           set -euo pipefail
+
           GRADLE=$(find source -maxdepth 5 -type f -name gradlew | head -n 1 || true)
+
           if [ -n "$GRADLE" ]; then
             ROOT=$(dirname "$GRADLE")
             echo "type=native" >> "$GITHUB_OUTPUT"
             echo "root=$ROOT" >> "$GITHUB_OUTPUT"
           else
             INDEX=$(find source -maxdepth 5 -type f -name index.html | head -n 1 || true)
+
             if [ -z "$INDEX" ]; then
               echo "No index.html or Gradle Android project found."
               exit 1
             fi
+
             echo "type=web" >> "$GITHUB_OUTPUT"
             echo "root=$(dirname "$INDEX")" >> "$GITHUB_OUTPUT"
           fi
@@ -183,12 +205,15 @@ jobs:
           SPLASH_BG: ${{ steps.config.outputs.splash_background }}
         run: |
           set -euo pipefail
+
           mkdir -p project/www
           cp -R "${{ steps.project.outputs.root }}/." project/www/
+
           cd project
           npm init -y
           npm install @capacitor/core@6 @capacitor/android@6
           npm install --save-dev @capacitor/cli@6
+
           cat > capacitor.config.json <<EOF
           {
             "appId": "$PACKAGE_ID",
@@ -205,6 +230,7 @@ jobs:
             }
           }
           EOF
+
           npx cap add android
 
       - name: Install backend and AdMob packages
@@ -215,11 +241,14 @@ jobs:
         id: packages
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           import json, os
+
           m = json.loads(os.environ["MANIFEST_JSON"])
           backend = (m.get("backend") or {}).get("provider", "none")
           admob = bool((m.get("admob") or {}).get("enabled"))
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("backend=" + backend + "\n")
               f.write("admob=" + str(admob).lower() + "\n")
@@ -247,6 +276,7 @@ jobs:
         working-directory: project
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           import json, os, pathlib
 
@@ -261,6 +291,7 @@ jobs:
               cfg = backend.get("supabase") or {}
               if not cfg.get("url") or not (cfg.get("publishable_key") or cfg.get("anon_key")):
                   raise SystemExit("Supabase URL and public client key are required.")
+
               source = """
           import { createClient } from '@supabase/supabase-js';
           const cfg = __BACKEND_CONFIG__;
@@ -272,6 +303,7 @@ jobs:
             features: s.features || {}
           };
           """
+
               config = {"supabase": cfg}
               pathlib.Path("backend-runtime.js").write_text(
                   source.replace("__BACKEND_CONFIG__", json.dumps(config))
@@ -280,15 +312,19 @@ jobs:
           elif provider == "firebase":
               cfg = backend.get("firebase") or {}
               firebase_config = cfg.get("config") or {}
+
               if not firebase_config.get("apiKey") or not firebase_config.get("projectId") or not firebase_config.get("appId"):
                   raise SystemExit("Firebase Web config requires apiKey, projectId and appId.")
+
               source = """
           import { initializeApp, getApps } from 'firebase/app';
           import { getAuth } from 'firebase/auth';
           import { getFirestore } from 'firebase/firestore';
           import { getStorage } from 'firebase/storage';
+
           const cfg = __FIREBASE_CONFIG__;
           const app = getApps().length ? getApps()[0] : initializeApp(cfg);
+
           window.BuilderBackend = {
             provider: 'firebase',
             app,
@@ -298,6 +334,7 @@ jobs:
             features: __FIREBASE_FEATURES__
           };
           """
+
               source = source.replace("__FIREBASE_CONFIG__", json.dumps(firebase_config))
               source = source.replace("__FIREBASE_FEATURES__", json.dumps(cfg.get("features") or {}))
               pathlib.Path("backend-runtime.js").write_text(source)
@@ -333,8 +370,10 @@ jobs:
           async function initializeAds() {
             if (initialized || !Capacitor.isNativePlatform()) return;
             initialized = true;
+
             try {
               let consentInfo = await AdMob.requestConsentInfo();
+
               if (consentInfo.isConsentFormAvailable &&
                   consentInfo.status === AdmobConsentStatus.REQUIRED) {
                 consentInfo = await AdMob.showConsentForm();
@@ -359,6 +398,7 @@ jobs:
                   isTesting: cfg.testMode
                 });
               }
+
               console.log('AdMob initialized.');
             } catch (error) {
               console.error('AdMob initialization failed:', error);
@@ -367,6 +407,7 @@ jobs:
 
           window.BuilderShowInterstitial = async function() {
             if (!cfg.interstitial || !Capacitor.isNativePlatform()) return;
+
             try {
               await AdMob.prepareInterstitial({
                 adId: cfg.interstitial,
@@ -380,6 +421,7 @@ jobs:
 
           window.BuilderShowRewarded = async function() {
             if (!cfg.rewarded || !Capacitor.isNativePlatform()) return null;
+
             try {
               await AdMob.prepareRewardVideoAd({
                 adId: cfg.rewarded,
@@ -394,6 +436,7 @@ jobs:
 
           window.addEventListener('builder-interstitial', () => {
             interstitialCount++;
+
             if (cfg.frequency > 0 && interstitialCount % cfg.frequency === 0) {
               window.BuilderShowInterstitial();
             }
@@ -405,6 +448,7 @@ jobs:
             initializeAds();
           }
           """
+
               config = {
                   "appId": app_id,
                   "banner": banner,
@@ -413,6 +457,7 @@ jobs:
                   "testMode": test_mode,
                   "frequency": max(0, int(admob.get("frequency", 3) or 0))
               }
+
               pathlib.Path("admob-runtime.js").write_text(
                   source.replace("__ADMOB_CONFIG__", json.dumps(config))
               )
@@ -432,21 +477,27 @@ jobs:
 
           python3 - <<'PY'
           import pathlib
+
           index = pathlib.Path("www/index.html")
           if not index.exists():
               raise SystemExit("www/index.html is missing.")
+
           html = index.read_text(errors="replace")
           tags = ""
+
           if pathlib.Path("www/builder-backend-runtime.js").exists():
               tags += '<script src="builder-backend-runtime.js"></script>'
+
           if pathlib.Path("www/builder-admob-runtime.js").exists():
               tags += '<script src="builder-admob-runtime.js"></script>'
+
           if tags:
               if "</head>" in html.lower():
                   pos = html.lower().rfind("</head>")
                   html = html[:pos] + tags + html[pos:]
               else:
                   html = tags + html
+
               index.write_text(html)
           PY
 
@@ -457,7 +508,9 @@ jobs:
         working-directory: project
         run: |
           set -euo pipefail
+
           python3 -m pip install --quiet pillow
+
           python3 - <<'PY'
           import json, os, pathlib
           from PIL import Image, ImageDraw, ImageFont
@@ -465,7 +518,6 @@ jobs:
           m = json.loads(os.environ["MANIFEST_JSON"])
           b = m.get("branding") or {}
           name = str(m.get("app_name", "My App"))[:40]
-          category = str(m.get("category", "app"))[:40]
 
           def rgb(value, default):
               try:
@@ -482,24 +534,44 @@ jobs:
           font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
           def font(size):
-              try: return ImageFont.truetype(font_path, size)
-              except Exception: return ImageFont.load_default()
+              try:
+                  return ImageFont.truetype(font_path, size)
+              except Exception:
+                  return ImageFont.load_default()
 
           def make_icon(size):
               im = Image.new("RGBA", (size,size), (0,0,0,0))
               d = ImageDraw.Draw(im)
               margin = int(size*.08)
-              d.rounded_rectangle((margin,margin,size-margin,size-margin), radius=int(size*.22), fill=primary)
+
+              d.rounded_rectangle(
+                  (margin,margin,size-margin,size-margin),
+                  radius=int(size*.22),
+                  fill=primary
+              )
+
               label = "".join(x[0] for x in name.split()[:2]).upper() or "A"
               f = font(int(size*.38))
               box = d.textbbox((0,0), label, font=f)
-              d.text(((size-(box[2]-box[0]))/2,(size-(box[3]-box[1]))/2-box[1]), label, fill=foreground, font=f)
+
+              d.text(
+                  ((size-(box[2]-box[0]))/2,
+                   (size-(box[3]-box[1]))/2-box[1]),
+                  label,
+                  fill=foreground,
+                  font=f
+              )
+
               return im
 
           assets = pathlib.Path("android/app/src/main/res")
+
           for folder, size in {
-              "mipmap-mdpi":48, "mipmap-hdpi":72, "mipmap-xhdpi":96,
-              "mipmap-xxhdpi":144, "mipmap-xxxhdpi":192
+              "mipmap-mdpi":48,
+              "mipmap-hdpi":72,
+              "mipmap-xhdpi":96,
+              "mipmap-xxhdpi":144,
+              "mipmap-xxxhdpi":192
           }.items():
               path = assets / folder
               path.mkdir(parents=True, exist_ok=True)
@@ -509,12 +581,20 @@ jobs:
 
           splash_dir = assets / "drawable"
           splash_dir.mkdir(parents=True, exist_ok=True)
+
           splash = Image.new("RGB", (1080,1920), background)
           draw = ImageDraw.Draw(splash)
           label = name[:24]
           f = font(76)
           box = draw.textbbox((0,0), label, font=f)
-          draw.text(((1080-(box[2]-box[0]))/2,900), label, fill=primary, font=f)
+
+          draw.text(
+              ((1080-(box[2]-box[0]))/2,900),
+              label,
+              fill=primary,
+              font=f
+          )
+
           splash.save(splash_dir / "builder_splash.png")
           print("Generated app icon and splash artwork.")
           PY
@@ -529,6 +609,7 @@ jobs:
         working-directory: project
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           import os, pathlib, re
 
@@ -539,17 +620,26 @@ jobs:
 
           gradle = pathlib.Path("android/app/build.gradle")
           text = gradle.read_text()
+
           text = re.sub(r'applicationId\s+"[^"]+"', f'applicationId "{package}"', text)
           text = re.sub(r'versionCode\s+\d+', f'versionCode {code}', text)
           text = re.sub(r'versionName\s+"[^"]+"', f'versionName "{version}"', text)
+
           gradle.write_text(text)
 
           strings = pathlib.Path("android/app/src/main/res/values/strings.xml")
           strings.parent.mkdir(parents=True, exist_ok=True)
+
+          safe_name = (
+              app_name.replace("&","&amp;")
+                      .replace("<","&lt;")
+                      .replace(">","&gt;")
+          )
+
           strings.write_text(
               '<?xml version="1.0" encoding="utf-8"?>\n'
               '<resources><string name="app_name">' +
-              app_name.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;") +
+              safe_name +
               '</string></resources>\n'
           )
           PY
@@ -572,16 +662,20 @@ jobs:
         id: apk
         run: |
           set -euo pipefail
+
           APK=$(find project source -type f -path "*/build/outputs/apk/*/*.apk" | head -n 1 || true)
+
           if [ -z "$APK" ]; then
             echo "APK output not found."
             exit 1
           fi
+
           mkdir -p output
           cp "$APK" output/app-debug.apk
           echo "path=output/app-debug.apk" >> "$GITHUB_OUTPUT"
           ls -lh output/app-debug.apk
 
+      # IMPORTANT: Find the draft release through the releases list API.
       - name: Upload APK to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -589,13 +683,27 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          RELEASE=$(curl -fsSL \
+
+          RELEASES=$(curl -fsSL \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/releases/tags/$TAG")
+            "https://api.github.com/repos/$REPO/releases?per_page=100")
+
+          RELEASE=$(echo "$RELEASES" | jq -c \
+            --arg tag "$TAG" \
+            '[.[] | select(.tag_name == $tag)][0] // empty')
+
+          if [ -z "$RELEASE" ]; then
+            echo "Draft release not found: $TAG"
+            exit 1
+          fi
+
           RELEASE_ID=$(echo "$RELEASE" | jq -r '.id')
-          test -n "$RELEASE_ID"
-          test "$RELEASE_ID" != "null"
+
+          if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" = "null" ]; then
+            echo "Release ID not found."
+            exit 1
+          fi
 
           curl -fsSL -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
@@ -612,11 +720,24 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          RELEASE=$(curl -fsSL \
+
+          RELEASES=$(curl -fsSL \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/releases/tags/$TAG")
-          ASSET_ID=$(echo "$RELEASE" | jq -r '.assets[] | select(.name=="source.zip") | .id' | head -n 1)
+            "https://api.github.com/repos/$REPO/releases?per_page=100")
+
+          RELEASE=$(echo "$RELEASES" | jq -c \
+            --arg tag "$TAG" \
+            '[.[] | select(.tag_name == $tag)][0] // empty')
+
+          if [ -z "$RELEASE" ]; then
+            echo "Release not found: $TAG"
+            exit 1
+          fi
+
+          ASSET_ID=$(echo "$RELEASE" | jq -r \
+            '.assets[] | select(.name=="source.zip") | .id' | head -n 1)
+
           if [ -n "$ASSET_ID" ] && [ "$ASSET_ID" != "null" ]; then
             curl -fsSL -X DELETE \
               -H "Authorization: Bearer $GH_TOKEN" \
@@ -632,11 +753,23 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          RELEASE=$(curl -fsSL \
+
+          RELEASES=$(curl -fsSL \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/releases/tags/$TAG")
+            "https://api.github.com/repos/$REPO/releases?per_page=100")
+
+          RELEASE=$(echo "$RELEASES" | jq -c \
+            --arg tag "$TAG" \
+            '[.[] | select(.tag_name == $tag)][0] // empty')
+
+          if [ -z "$RELEASE" ]; then
+            echo "Release not found: $TAG"
+            exit 1
+          fi
+
           RELEASE_ID=$(echo "$RELEASE" | jq -r '.id')
+
           curl -fsSL -X PATCH \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
