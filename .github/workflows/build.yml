@@ -1,3 +1,4 @@
+
 name: Advanced Cloud APK Builder
 
 run-name: APK Builder - ${{ inputs.run_id }}
@@ -92,7 +93,6 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -210,6 +210,7 @@ jobs:
         env:
           MANIFEST_JSON: ${{ inputs.manifest_json }}
         working-directory: project
+        id: packages
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -221,7 +222,6 @@ jobs:
               f.write("backend=" + backend + "\n")
               f.write("admob=" + str(admob).lower() + "\n")
           PY
-        id: packages
 
       - name: Install Supabase SDK
         if: steps.project.outputs.type == 'web' && steps.packages.outputs.backend == 'supabase'
@@ -271,7 +271,7 @@ jobs:
           };
           """
               config = {"supabase": cfg}
-              (pathlib.Path("backend-runtime.js")).write_text(
+              pathlib.Path("backend-runtime.js").write_text(
                   source.replace("__BACKEND_CONFIG__", json.dumps(config))
               )
 
@@ -298,7 +298,7 @@ jobs:
           """
               source = source.replace("__FIREBASE_CONFIG__", json.dumps(firebase_config))
               source = source.replace("__FIREBASE_FEATURES__", json.dumps(cfg.get("features") or {}))
-              (pathlib.Path("backend-runtime.js")).write_text(source)
+              pathlib.Path("backend-runtime.js").write_text(source)
 
           if admob.get("enabled"):
               test_mode = bool(admob.get("test_mode", True))
@@ -338,7 +338,6 @@ jobs:
                 consentInfo = await AdMob.showConsentForm();
               }
 
-              // Capacitor AdMob v6 exposes consent status, not canRequestAds.
               if (consentInfo.status === AdmobConsentStatus.REQUIRED ||
                   consentInfo.status === AdmobConsentStatus.UNKNOWN) {
                 console.warn('AdMob consent is not ready; ads were not requested.');
@@ -412,7 +411,7 @@ jobs:
                   "testMode": test_mode,
                   "frequency": max(0, int(admob.get("frequency", 3) or 0))
               }
-              (pathlib.Path("admob-runtime.js")).write_text(
+              pathlib.Path("admob-runtime.js").write_text(
                   source.replace("__ADMOB_CONFIG__", json.dumps(config))
               )
 
@@ -488,177 +487,123 @@ jobs:
               im = Image.new("RGBA", (size,size), (0,0,0,0))
               d = ImageDraw.Draw(im)
               margin = int(size*.08)
-              d.rounded_rectangle((margin,margin,size-margin,size-margin),
-                                  radius=int(size*.22), fill=primary)
-              letter = (name[:1] or "A").upper()
-              f = font(int(size*.48))
-              box = d.textbbox((0,0), letter, font=f)
-              x = (size-(box[2]-box[0]))/2
-              y = (size-(box[3]-box[1]))/2-box[1]
-              d.text((x,y), letter, fill=foreground, font=f)
+              d.rounded_rectangle((margin,margin,size-margin,size-margin), radius=int(size*.22), fill=primary)
+              label = "".join(x[0] for x in name.split()[:2]).upper() or "A"
+              f = font(int(size*.38))
+              box = d.textbbox((0,0), label, font=f)
+              d.text(((size-(box[2]-box[0]))/2,(size-(box[3]-box[1]))/2-box[1]), label, fill=foreground, font=f)
               return im
 
-          make_icon(1024).save("builder-icon.png")
+          assets = pathlib.Path("android/app/src/main/res")
+          for folder, size in {
+              "mipmap-mdpi":48, "mipmap-hdpi":72, "mipmap-xhdpi":96,
+              "mipmap-xxhdpi":144, "mipmap-xxxhdpi":192
+          }.items():
+              path = assets / folder
+              path.mkdir(parents=True, exist_ok=True)
+              icon = make_icon(size)
+              icon.save(path / "ic_launcher.png")
+              icon.save(path / "ic_launcher_round.png")
 
-          splash = Image.new("RGB", (1600,2400), background)
-          logo = make_icon(600)
-          splash.paste(logo, (500,650), logo)
+          splash_dir = assets / "drawable"
+          splash_dir.mkdir(parents=True, exist_ok=True)
+          splash = Image.new("RGB", (1080,1920), background)
           draw = ImageDraw.Draw(splash)
-          for text, y, size in ((name,1320,72),(category,1430,34)):
-              f = font(size)
-              box = draw.textbbox((0,0), text, font=f)
-              draw.text(((1600-(box[2]-box[0]))/2,y), text, font=f, fill=primary)
-          splash.save("builder-splash.png")
-
-          res = pathlib.Path("android/app/src/main/res")
-          density_sizes = {"mdpi":48,"hdpi":72,"xhdpi":96,"xxhdpi":144,"xxxhdpi":192}
-          for density,size in density_sizes.items():
-              folder = res / ("mipmap-" + density)
-              folder.mkdir(parents=True, exist_ok=True)
-              make_icon(size).save(folder / "ic_launcher.png")
-              make_icon(size).save(folder / "ic_launcher_round.png")
-
-          fg = Image.new("RGBA",(432,432),(0,0,0,0))
-          mark = make_icon(300)
-          fg.paste(mark,(66,66),mark)
-          (res/"mipmap-xxxhdpi").mkdir(parents=True,exist_ok=True)
-          fg.save(res/"mipmap-xxxhdpi"/"ic_launcher_foreground.png")
-
-          anydpi = res/"mipmap-anydpi-v26"
-          anydpi.mkdir(parents=True,exist_ok=True)
-          adaptive = '''<?xml version="1.0" encoding="utf-8"?>
-          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android"><background android:drawable="@color/ic_launcher_background"/><foreground android:drawable="@mipmap/ic_launcher_foreground"/></adaptive-icon>'''
-          (anydpi/"ic_launcher.xml").write_text(adaptive)
-          (anydpi/"ic_launcher_round.xml").write_text(adaptive)
-
-          values = res/"values"
-          values.mkdir(parents=True,exist_ok=True)
-          (values/"builder_colors.xml").write_text(
-              '<?xml version="1.0" encoding="utf-8"?>'
-              '<resources><color name="ic_launcher_background">#%02x%02x%02x</color></resources>' % primary
-          )
-
-          splash_dir = res/"drawable-nodpi"
-          splash_dir.mkdir(parents=True,exist_ok=True)
-          splash.save(splash_dir/"splash.png")
+          label = name[:24]
+          f = font(76)
+          box = draw.textbbox((0,0), label, font=f)
+          draw.text(((1080-(box[2]-box[0]))/2,900), label, fill=primary, font=f)
+          splash.save(splash_dir / "builder_splash.png")
+          print("Generated app icon and splash artwork.")
           PY
 
-      - name: Sync Capacitor Android
-        if: steps.project.outputs.type == 'web'
-        working-directory: project
-        run: npx cap sync android
-
-      - name: Configure Android app metadata and AdMob App ID
+      - name: Configure Android app identity
         if: steps.project.outputs.type == 'web'
         env:
           APP_NAME: ${{ steps.config.outputs.app_name }}
           PACKAGE_ID: ${{ steps.config.outputs.package_id }}
           APP_VERSION: ${{ steps.config.outputs.version }}
           VERSION_CODE: ${{ steps.config.outputs.version_code }}
-          MANIFEST_JSON: ${{ inputs.manifest_json }}
         working-directory: project
         run: |
+          set -euo pipefail
           python3 - <<'PY'
-          import pathlib, os, re, json, xml.etree.ElementTree as ET
+          import os, pathlib, re
 
-          app = pathlib.Path("android/app")
-          gradle = app/"build.gradle"
-          if not gradle.exists():
-              raise SystemExit("Expected Android Groovy build.gradle not found.")
+          app_name = os.environ["APP_NAME"]
+          package = os.environ["PACKAGE_ID"]
+          version = os.environ["APP_VERSION"]
+          code = os.environ["VERSION_CODE"]
 
+          gradle = pathlib.Path("android/app/build.gradle")
           text = gradle.read_text()
-          replacements = [
-              (r'applicationId\s+["\'][^"\']+["\']', 'applicationId "'+os.environ["PACKAGE_ID"]+'"'),
-              (r'versionCode\s+\d+', 'versionCode '+os.environ["VERSION_CODE"]),
-              (r'versionName\s+["\'][^"\']+["\']', 'versionName "'+os.environ["APP_VERSION"]+'"')
-          ]
-          for pattern, replacement in replacements:
-              if re.search(pattern,text):
-                  text = re.sub(pattern,replacement,text,count=1)
+          text = re.sub(r'applicationId\s+"[^"]+"', f'applicationId "{package}"', text)
+          text = re.sub(r'versionCode\s+\d+', f'versionCode {code}', text)
+          text = re.sub(r'versionName\s+"[^"]+"', f'versionName "{version}"', text)
           gradle.write_text(text)
 
-          ns = "{http://schemas.android.com/apk/res/android}"
-          strings = app/"src/main/res/values/strings.xml"
-          strings.parent.mkdir(parents=True,exist_ok=True)
-          if strings.exists():
-              tree = ET.parse(strings); root = tree.getroot()
-          else:
-              root = ET.Element("resources"); tree = ET.ElementTree(root)
-
-          def put_string(key,value):
-              node = root.find("string[@name='"+key+"']")
-              if node is None: node = ET.SubElement(root,"string",{"name":key})
-              node.text = value
-
-          put_string("app_name",os.environ["APP_NAME"])
-
-          m = json.loads(os.environ["MANIFEST_JSON"])
-          admob = m.get("admob") or {}
-          if admob.get("enabled"):
-              app_id = str(admob.get("app_id") or "").strip()
-              if admob.get("test_mode",True):
-                  app_id = app_id or "ca-app-pub-3940256099942544~3347511713"
-              if not app_id:
-                  raise SystemExit("AdMob App ID is required in live mode.")
-              put_string("admob_app_id",app_id)
-
-          tree.write(strings,encoding="utf-8",xml_declaration=True)
-
-          manifest_path = app/"src/main/AndroidManifest.xml"
-          tree = ET.parse(manifest_path)
-          root = tree.getroot()
-          application = root.find("application")
-          if application is None:
-              raise SystemExit("AndroidManifest.xml has no application element.")
-
-          app_label = application.get(ns+"label")
-          if not app_label:
-              application.set(ns+"label","@string/app_name")
-
-          if admob.get("enabled"):
-              existing = None
-              for item in application.findall("meta-data"):
-                  if item.get(ns+"name") == "com.google.android.gms.ads.APPLICATION_ID":
-                      existing = item
-                      break
-              if existing is None:
-                  existing = ET.SubElement(application,"meta-data")
-              existing.set(ns+"name","com.google.android.gms.ads.APPLICATION_ID")
-              existing.set(ns+"value","@string/admob_app_id")
-
-          tree.write(manifest_path,encoding="utf-8",xml_declaration=True)
+          strings = pathlib.Path("android/app/src/main/res/values/strings.xml")
+          strings.parent.mkdir(parents=True, exist_ok=True)
+          strings.write_text(
+              '<?xml version="1.0" encoding="utf-8"?>\n'
+              '<resources><string name="app_name">' +
+              app_name.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;") +
+              '</string></resources>\n'
+          )
           PY
 
-      - name: Prepare native Android project
-        if: steps.project.outputs.type == 'native'
+      - name: Build Android APK
+        if: steps.project.outputs.type == 'web'
+        working-directory: project/android
         run: |
-          mkdir -p native-project
-          cp -R "${{ steps.project.outputs.root }}/." native-project/
-          chmod +x native-project/gradlew
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace assembleDebug
 
-      - name: Build debug APK
+      - name: Build native Android project
+        if: steps.project.outputs.type == 'native'
+        working-directory: ${{ steps.project.outputs.root }}
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Locate APK
+        id: apk
         run: |
           set -euo pipefail
-          if [ "${{ steps.project.outputs.type }}" = "web" ]; then
-            cd project/android
-          else
-            cd native-project
-          fi
-
-          chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
-
-          APK=$(find . -type f -path '*/outputs/apk/*' -name '*.apk' | head -n 1)
+          APK=$(find project source -type f -path "*/build/outputs/apk/*/*.apk" | head -n 1 || true)
           if [ -z "$APK" ]; then
             echo "APK output not found."
             exit 1
           fi
+          mkdir -p output
+          cp "$APK" output/app-debug.apk
+          echo "path=output/app-debug.apk" >> "$GITHUB_OUTPUT"
+          ls -lh output/app-debug.apk
 
-          mkdir -p "$GITHUB_WORKSPACE/output"
-          cp "$APK" "$GITHUB_WORKSPACE/output/app-debug.apk"
-          test -s "$GITHUB_WORKSPACE/output/app-debug.apk"
+      - name: Upload APK to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          RELEASE=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/releases/tags/$TAG")
+          RELEASE_ID=$(echo "$RELEASE" | jq -r '.id')
+          test -n "$RELEASE_ID"
+          test "$RELEASE_ID" != "null"
+
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @output/app-debug.apk \
+            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=app-debug.apk"
 
       - name: Remove source ZIP from release
+        if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.release_tag }}
@@ -677,26 +622,8 @@ jobs:
               "https://api.github.com/repos/$REPO/releases/assets/$ASSET_ID"
           fi
 
-      - name: Upload APK to GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.release_tag }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          RELEASE=$(curl -fsSL \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/releases/tags/$TAG")
-          RELEASE_ID=$(echo "$RELEASE" | jq -r '.id')
-          curl -fL -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Content-Type: application/vnd.android.package-archive" \
-            --data-binary "@output/app-debug.apk" \
-            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=app-debug.apk"
-
-      - name: Publish APK release
+      - name: Publish GitHub Release
+        if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.release_tag }}
@@ -712,19 +639,21 @@ jobs:
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "Content-Type: application/json" \
-            -d '{"draft":false}' \
+            -d '{"draft":false,"prerelease":false}' \
             "https://api.github.com/repos/$REPO/releases/$RELEASE_ID"
 
       - name: Build summary
         if: success()
         run: |
           echo "## APK build successful" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Request ID: ${{ inputs.run_id }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Release: ${{ inputs.release_tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- App: ${{ steps.config.outputs.app_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Package: ${{ steps.config.outputs.package_id }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Version: ${{ steps.config.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- APK: app-debug.apk" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Release: ${{ inputs.release_tag }}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Failure summary
         if: failure()
         run: |
           echo "## APK build failed" >> "$GITHUB_STEP_SUMMARY"
-          echo "Open the failed step above to inspect the error." >> "$GITHUB_STEP_SUMMARY"
+          echo "Check the failed step above for the exact error." >> "$GITHUB_STEP_SUMMARY"
