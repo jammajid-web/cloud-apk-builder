@@ -196,12 +196,17 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # UPDATED ANDROID SDK SETUP
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
 
       - name: Install Android SDK components
         run: |
-          sdkmanager "platform-tools" \
+          set -euo pipefail
+
+          sdkmanager --install \
             "platforms;android-35" \
             "build-tools;35.0.0"
 
@@ -455,12 +460,9 @@ jobs:
               open("www/admob-config.json", "w")
           )
 
-          # Runtime config fix:
-          # This file loads before admob-runtime.js.
           open("www/admob-config.js", "w").write(
               "window.APP_ADMOB_CONFIG=" + json.dumps(cfg) + ";"
           )
-
           PY
 
           if python3 -c \
@@ -608,7 +610,6 @@ jobs:
 
           page = open(path, encoding="utf-8").read()
 
-          # Config MUST load before the AdMob runtime.
           tag = (
               '<script src="./admob-config.js"></script>'
               '<script src="./admob-runtime.js"></script>'
