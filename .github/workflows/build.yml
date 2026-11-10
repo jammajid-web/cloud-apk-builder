@@ -1,504 +1,293 @@
 
-name: Build Android APK
+name: Cloud APK Builder
+
+run-name: APK Builder - ${{ inputs.run_id }}
 
 on:
   workflow_dispatch:
     inputs:
-      app_name:
-        description: "Application Name"
+      run_id:
+        description: Unique build ID
         required: true
         type: string
-
-      package_id:
-        description: "Android Package ID"
+      release_tag:
+        description: GitHub Release tag
         required: true
         type: string
-
-      html:
-        description: "HTML Base64"
+      manifest_json:
+        description: App build configuration
         required: true
-        type: string
-
-      css:
-        description: "CSS Base64"
-        required: false
-        type: string
-
-      js:
-        description: "JavaScript Base64"
-        required: false
-        type: string
-
-      branding_key:
-        description: "Custom Branding Key"
-        required: false
-        type: string
-
-      ads_enabled:
-        description: "Enable AdMob"
-        required: false
-        type: string
-        default: "false"
-
-      admob_test_mode:
-        description: "AdMob Test Mode"
-        required: false
-        type: string
-        default: "true"
-
-      admob_config:
-        description: "AdMob Configuration JSON"
-        required: false
         type: string
 
 permissions:
-  contents: read
+  contents: write
+  actions: read
 
 concurrency:
-  group: apk-build-${{ github.ref }}
+  group: apk-build-${{ inputs.run_id }}
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build Android APK
+    name: Build Android App
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_ID: ${{ inputs.run_id }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      MANIFEST_JSON: ${{ inputs.manifest_json }}
+
     steps:
-      - name: Checkout Repository
+      - name: Checkout builder
         uses: actions/checkout@v4
 
-      - name: Validate Inputs
+      - name: Validate build request
         shell: bash
-        env:
-          APP_NAME: ${{ inputs.app_name }}
-          PACKAGE_ID: ${{ inputs.package_id }}
-          HTML_B64: ${{ inputs.html }}
         run: |
-          set -e
+          set -euo pipefail
 
-          if [ -z "$APP_NAME" ]; then
-            echo "::error::Application name is missing"
-            exit 1
-          fi
+          python3 - <<'PY'
+          import json, os, re
 
-          if [[ ! "$PACKAGE_ID" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]]; then
-            echo "::error::Invalid Android package ID"
-            exit 1
-          fi
+          run_id = os.environ["RUN_ID"]
+          tag = os.environ["RELEASE_TAG"]
+          raw = os.environ["MANIFEST_JSON"]
 
-          if [ -z "$HTML_B64" ]; then
-            echo "::error::HTML input is missing"
-            exit 1
-          fi
+          if not re.fullmatch(r"[a-fA-F0-9-]{20,64}", run_id):
+              raise SystemExit("Invalid run_id")
 
-          if ! printf '%s' "$HTML_B64" | base64 --decode >/dev/null 2>&1; then
-            echo "::error::HTML is not valid Base64"
-            exit 1
-          fi
+          if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", tag):
+              raise SystemExit("Invalid release tag")
 
-          echo "Input validation successful"
+          data = json.loads(raw)
+          if not isinstance(data, dict):
+              raise SystemExit("Manifest must be a JSON object")
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
+          print("Build request validated.")
+          print("App:", data.get("app_name", "My App"))
+          print("Package:", data.get("package_id", "com.example.app"))
+          PY
 
-      - name: Setup Java
-        uses: actions/setup-java@v5
+      - name: Download project source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p source project output
+
+          gh release download "$RELEASE_TAG" \
+            --repo "$GH_REPO" \
+            --pattern "source.zip" \
+            --dir source
+
+          test -s source/source.zip
+
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import PurePosixPath
+
+          archive = zipfile.ZipFile("source/source.zip")
+
+          for item in archive.infolist():
+              path = PurePosixPath(item.filename)
+
+              if path.is_absolute() or ".." in path.parts:
+                  raise SystemExit("Unsafe path found in project ZIP")
+
+              if item.filename.startswith("/"):
+                  raise SystemExit("Absolute ZIP path rejected")
+
+          archive.extractall("project")
+          print("Project extracted safely.")
+          PY
+
+      - name: Read app configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json, os
+
+          data = json.loads(os.environ["MANIFEST_JSON"])
+
+          app_name = str(data.get("app_name") or "My App")
+          package_id = str(data.get("package_id") or "com.example.app")
+          version = str(data.get("version") or "1.0.0")
+          version_code = str(data.get("version_code") or "1")
+
+          if not all(c.isalnum() or c in "._" for c in package_id):
+              raise SystemExit("Invalid package ID")
+
+          if "." not in package_id:
+              raise SystemExit("Package ID must contain a dot")
+
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("APP_NAME=" + app_name.replace("\n", " ") + "\n")
+              f.write("PACKAGE_ID=" + package_id + "\n")
+              f.write("APP_VERSION=" + version + "\n")
+              f.write("VERSION_CODE=" + version_code + "\n")
+          PY
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK Packages
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Detect project type
+        id: detect
         shell: bash
         run: |
-          set -e
-          sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0"
-
-      - name: Prepare Web App
-        shell: bash
-        env:
-          HTML_B64: ${{ inputs.html }}
-          CSS_B64: ${{ inputs.css }}
-          JS_B64: ${{ inputs.js }}
-        run: |
-          set -e
-          mkdir -p www
-
-          printf '%s' "$HTML_B64" | base64 --decode > www/index.html
-
-          if [ -n "$CSS_B64" ]; then
-            printf '%s' "$CSS_B64" | base64 --decode > /tmp/app-style.css
-
-            python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          html = Path("www/index.html")
-          content = html.read_text(encoding="utf-8")
-          css = Path("/tmp/app-style.css").read_text(encoding="utf-8")
-
-          style = "\n<style>\n" + css + "\n</style>\n"
-
-          if re.search(r"</head>", content, re.I):
-              content = re.sub(
-                  r"</head>",
-                  lambda m: style + m.group(0),
-                  content,
-                  count=1,
-                  flags=re.I
-              )
-          else:
-              content = style + content
-
-          html.write_text(content, encoding="utf-8")
-          PY
-          fi
-
-          if [ -n "$JS_B64" ]; then
-            printf '%s' "$JS_B64" | base64 --decode > /tmp/app-script.js
-
-            python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          html = Path("www/index.html")
-          content = html.read_text(encoding="utf-8")
-          js = Path("/tmp/app-script.js").read_text(encoding="utf-8")
-
-          script = "\n<script>\n" + js + "\n</script>\n"
-
-          if re.search(r"</body>", content, re.I):
-              content = re.sub(
-                  r"</body>",
-                  lambda m: script + m.group(0),
-                  content,
-                  count=1,
-                  flags=re.I
-              )
-          else:
-              content += script
-
-          html.write_text(content, encoding="utf-8")
-          PY
-          fi
-
-          test -s www/index.html
-          echo "Web app prepared successfully"
-
-      - name: Install Capacitor
-        run: |
-          set -e
-          npm init -y
-          npm install @capacitor/core@6.2.1
-          npm install @capacitor/cli@6.2.1
-          npm install @capacitor/android@6.2.1
-
-      - name: Configure Capacitor
-        env:
-          APP_NAME: ${{ inputs.app_name }}
-          PACKAGE_ID: ${{ inputs.package_id }}
-        run: |
-          set -e
-          npx cap init "$APP_NAME" "$PACKAGE_ID" --web-dir www
-          npx cap add android
-
-      - name: Install AdMob
-        if: ${{ inputs.ads_enabled == 'true' }}
-        run: |
-          set -e
-          npm install @capacitor-community/admob@6
-          npm install --save-dev esbuild
-
-      - name: Prepare AdMob Configuration
-        if: ${{ inputs.ads_enabled == 'true' }}
-        env:
-          ADMOB_CONFIG: ${{ inputs.admob_config }}
-          ADMOB_TEST_MODE: ${{ inputs.admob_test_mode }}
-        run: |
-          set -e
-
-          node <<'NODE'
-          const fs = require('fs');
-
-          let config = {};
-
-          try {
-            config = JSON.parse(process.env.ADMOB_CONFIG || '{}');
-          } catch (error) {
-            console.error('Invalid AdMob configuration JSON');
-            process.exit(1);
-          }
-
-          const testMode = process.env.ADMOB_TEST_MODE !== 'false';
-
-          const appId = config.app_id ||
-            (testMode ? 'ca-app-pub-3940256099942544~3347511713' : '');
-
-          const bannerId = config.banner_id ||
-            (testMode ? 'ca-app-pub-3940256099942544/6300978111' : '');
-
-          const interstitialId = config.interstitial_id ||
-            (testMode ? 'ca-app-pub-3940256099942544/1033173712' : '');
-
-          if (!appId || !bannerId || !interstitialId) {
-            throw new Error('AdMob IDs are missing');
-          }
-
-          fs.writeFileSync(
-            'www/admob-config.json',
-            JSON.stringify({
-              enabled: true,
-              test_mode: testMode,
-              app_id: appId,
-              banner_id: bannerId,
-              interstitial_id: interstitialId
-            }, null, 2)
-          );
-
-          fs.appendFileSync(
-            process.env.GITHUB_ENV,
-            `ADMOB_APP_ID=${appId}\n`
-          );
-
-          console.log('AdMob configuration prepared');
-          NODE
-
-      - name: Build AdMob JavaScript Bridge
-        if: ${{ inputs.ads_enabled == 'true' }}
-        run: |
-          set -e
-          mkdir -p src
-
-          cat > src/admob-bridge.js <<'JS'
-          import { Capacitor } from '@capacitor/core';
-
-          import {
-            AdMob,
-            BannerAdSize,
-            BannerAdPosition
-          } from '@capacitor-community/admob';
-
-          let config = {};
-          let initialized = false;
-          let initializing = false;
-          let interstitialReady = false;
-
-          async function loadInterstitial() {
-            if (!initialized || !config.interstitial_id) return;
-
-            try {
-              await AdMob.prepareInterstitial({
-                adId: config.interstitial_id,
-                isTesting: !!config.test_mode
-              });
-
-              interstitialReady = true;
-              console.log('Interstitial ready');
-
-            } catch (error) {
-              interstitialReady = false;
-              console.error('Interstitial load failed:', error);
-            }
-          }
-
-          async function initializeAds() {
-            if (initialized || initializing) return;
-            if (!Capacitor.isNativePlatform()) return;
-
-            initializing = true;
-
-            try {
-              const response = await fetch('./admob-config.json');
-
-              if (!response.ok) {
-                throw new Error('AdMob config file not found');
-              }
-
-              config = await response.json();
-
-              if (!config.enabled) return;
-
-              await AdMob.initialize();
-              initialized = true;
-
-              if (config.banner_id) {
-                try {
-                  await AdMob.showBanner({
-                    adId: config.banner_id,
-                    adSize: BannerAdSize.ADAPTIVE_BANNER,
-                    position: BannerAdPosition.BOTTOM_CENTER,
-                    margin: 0,
-                    isTesting: !!config.test_mode
-                  });
-
-                  document.body.style.paddingBottom =
-                    'calc(60px + env(safe-area-inset-bottom, 0px))';
-
-                  console.log('Banner displayed');
-
-                } catch (error) {
-                  console.error('Banner failed:', error);
-                }
-              }
-
-              await loadInterstitial();
-
-            } catch (error) {
-              console.error('AdMob initialization failed:', error);
-
-            } finally {
-              initializing = false;
-            }
-          }
-
-          async function showInterstitial() {
-            if (!initialized || !interstitialReady) return false;
-
-            interstitialReady = false;
-
-            try {
-              await AdMob.showInterstitial();
-              void loadInterstitial();
-              return true;
-
-            } catch (error) {
-              console.error('Interstitial display failed:', error);
-              void loadInterstitial();
-              return false;
-            }
-          }
-
-          window.CalculatorAds = {
-            initialize: initializeAds,
-            showInterstitial
-          };
-
-          if (document.readyState === 'loading') {
-            document.addEventListener(
-              'DOMContentLoaded',
-              initializeAds,
-              { once: true }
-            );
-          } else {
-            void initializeAds();
-          }
-          JS
-
-          npx esbuild src/admob-bridge.js \
-            --bundle \
-            --platform=browser \
-            --format=iife \
-            --outfile=www/admob-bridge.js
-
-          printf '\n<script src="./admob-bridge.js"></script>\n' >> www/index.html
-
-      - name: Configure AdMob Manifest
-        if: ${{ inputs.ads_enabled == 'true' }}
-        env:
-          ADMOB_APP_ID: ${{ env.ADMOB_APP_ID }}
-        run: |
-          set -e
-
-          python3 <<'PY'
-          import os
-          import re
-          from xml.sax.saxutils import escape
-
-          path = "android/app/src/main/AndroidManifest.xml"
-
-          with open(path, "r", encoding="utf-8") as f:
-              content = f.read()
-
-          app_id = os.environ.get("ADMOB_APP_ID", "").strip()
-
-          if not app_id:
-              raise SystemExit("AdMob App ID is missing")
-
-          metadata = (
-              '<meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" '
-              f'android:value="{escape(app_id)}" />'
-          )
-
-          if "com.google.android.gms.ads.APPLICATION_ID" not in content:
-              content = re.sub(
-                  r"</application>",
-                  metadata + "\n    </application>",
-                  content,
-                  count=1
-              )
-
-          with open(path, "w", encoding="utf-8") as f:
-              f.write(content)
-
-          print("AdMob manifest configured")
-          PY
-
-      - name: Prepare Custom Branding
-        if: ${{ inputs.branding_key != '' }}
-        env:
-          BRANDING_KEY: ${{ inputs.branding_key }}
-        run: |
-          set -e
-          mkdir -p assets
-
-          if [ -f "branding/$BRANDING_KEY/icon.png" ]; then
-            cp "branding/$BRANDING_KEY/icon.png" assets/icon.png
-          fi
-
-          if [ -f "branding/$BRANDING_KEY/splash.png" ]; then
-            cp "branding/$BRANDING_KEY/splash.png" assets/splash.png
-          fi
-
-          if [ -f assets/icon.png ] || [ -f assets/splash.png ]; then
-            npm install --save-dev @capacitor/assets@3
-            npx capacitor-assets generate --android
+          set -euo pipefail
+
+          if find project -name gradlew -type f | grep -q .; then
+            echo "type=native" >> "$GITHUB_OUTPUT"
+            echo "Native Android Gradle project detected."
+          elif find project -name index.html -type f | grep -q .; then
+            echo "type=web" >> "$GITHUB_OUTPUT"
+            echo "Web project detected."
           else
-            echo "No custom branding assets found"
-          fi
-
-      - name: Sync Android
-        run: |
-          set -e
-          npx cap sync android
-
-      - name: Configure Gradle
-        run: |
-          set -e
-          chmod +x android/gradlew
-
-      - name: Build Android APK
-        run: |
-          set -e
-          cd android
-          ./gradlew assembleDebug --no-daemon --stacktrace
-
-      - name: Verify APK
-        shell: bash
-        run: |
-          set -e
-
-          APK="android/app/build/outputs/apk/debug/app-debug.apk"
-
-          if [ ! -s "$APK" ]; then
-            echo "::error::APK file was not generated"
+            echo "Unsupported project."
+            echo "ZIP must contain an Android Gradle project or web app with index.html."
             exit 1
           fi
 
-          echo "APK successfully generated"
-          ls -lh "$APK"
+      - name: Build web project with Capacitor
+        if: steps.detect.outputs.type == 'web'
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-          retention-days: 7
+          cd project
+
+          ROOT="$(find . -name index.html -type f \
+            -not -path './node_modules/*' \
+            -not -path './.git/*' | head -n 1)"
+
+          test -n "$ROOT"
+
+          WEB_DIR="$(dirname "$ROOT")"
+
+          mkdir -p www
+          cp -R "$WEB_DIR"/. www/
+
+          npm init -y
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+
+          cat > capacitor.config.json <<EOF
+          {
+            "appId": "$PACKAGE_ID",
+            "appName": "$APP_NAME",
+            "webDir": "www",
+            "bundledWebRuntime": false
+          }
+          EOF
+
+          npx cap add android
+          npx cap sync android
+
+      - name: Locate Android project
+        id: android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ steps.detect.outputs.type }}" = "native" ]; then
+            GRADLE="$(find project -name gradlew -type f | head -n 1)"
+            ANDROID_DIR="$(dirname "$GRADLE")"
+          else
+            ANDROID_DIR="project/android"
+          fi
+
+          test -f "$ANDROID_DIR/gradlew"
+
+          echo "dir=$ANDROID_DIR" >> "$GITHUB_OUTPUT"
+
+          chmod +x "$ANDROID_DIR/gradlew"
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "${{ steps.android.outputs.dir }}"
+
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Find and prepare APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$(find project -type f \
+            -path '*/build/outputs/apk/*/*.apk' \
+            | head -n 1)"
+
+          if [ -z "$APK" ]; then
+            echo "APK output not found."
+            exit 1
+          fi
+
+          cp "$APK" output/app-debug.apk
+
+          test -s output/app-debug.apk
+
+          echo "APK created successfully."
+          ls -lh output/app-debug.apk
+
+      - name: Upload APK to GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release upload "$RELEASE_TAG" \
+            output/app-debug.apk \
+            --repo "$GH_REPO" \
+            --clobber
+
+      - name: Remove temporary source ZIP
+        if: success()
+        continue-on-error: true
+        shell: bash
+        run: |
+          gh release delete-asset "$RELEASE_TAG" source.zip \
+            --repo "$GH_REPO" \
+            --yes
+
+      - name: Publish completed release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GH_REPO" \
+            --draft=false \
+            --prerelease=false
+
+      - name: Build summary
+        if: success()
+        run: |
+          {
+            echo "## APK Build Successful"
+            echo ""
+            echo "- App: $APP_NAME"
+            echo "- Package: $PACKAGE_ID"
+            echo "- Version: $APP_VERSION"
+            echo "- Build ID: $RUN_ID"
+            echo "- APK: app-debug.apk"
+            echo ""
+            echo "The APK is attached to the GitHub Release."
+          } >> "$GITHUB_STEP_SUMMARY"
