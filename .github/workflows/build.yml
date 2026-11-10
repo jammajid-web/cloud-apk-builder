@@ -63,6 +63,7 @@ jobs:
               raise SystemExit("Invalid release tag")
 
           data = json.loads(raw)
+
           if not isinstance(data, dict):
               raise SystemExit("Manifest must be a JSON object")
 
@@ -110,7 +111,7 @@ jobs:
           set -euo pipefail
 
           python3 - <<'PY'
-          import json, os
+          import json, os, re
 
           data = json.loads(os.environ["MANIFEST_JSON"])
 
@@ -119,14 +120,14 @@ jobs:
           version = str(data.get("version") or "1.0.0")
           version_code = str(data.get("version_code") or "1")
 
-          if not all(c.isalnum() or c in "._" for c in package_id):
+          if not re.fullmatch(r"[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+", package_id):
               raise SystemExit("Invalid package ID")
 
-          if "." not in package_id:
-              raise SystemExit("Package ID must contain a dot")
+          if not version_code.isdigit():
+              raise SystemExit("Invalid version code")
 
           with open(os.environ["GITHUB_ENV"], "a") as f:
-              f.write("APP_NAME=" + app_name.replace("\n", " ") + "\n")
+              f.write("APP_NAME=" + app_name.replace("\n", " ").replace("\r", " ") + "\n")
               f.write("PACKAGE_ID=" + package_id + "\n")
               f.write("APP_VERSION=" + version + "\n")
               f.write("VERSION_CODE=" + version_code + "\n")
@@ -142,7 +143,10 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install Android SDK packages
+        shell: bash
         run: |
+          set -euo pipefail
+
           sdkmanager "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
@@ -153,12 +157,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          if find project -name gradlew -type f | grep -q .; then
+          if find project -name gradlew -type f \
+            -not -path '*/node_modules/*' | grep -q .; then
+
             echo "type=native" >> "$GITHUB_OUTPUT"
             echo "Native Android Gradle project detected."
-          elif find project -name index.html -type f | grep -q .; then
+
+          elif find project -name index.html -type f \
+            -not -path '*/node_modules/*' \
+            -not -path '*/android/*' | grep -q .; then
+
             echo "type=web" >> "$GITHUB_OUTPUT"
             echo "Web project detected."
+
           else
             echo "Unsupported project."
             echo "ZIP must contain an Android Gradle project or web app with index.html."
@@ -175,17 +186,31 @@ jobs:
 
           ROOT="$(find . -name index.html -type f \
             -not -path './node_modules/*' \
+            -not -path './android/*' \
             -not -path './.git/*' | head -n 1)"
 
           test -n "$ROOT"
 
           WEB_DIR="$(dirname "$ROOT")"
 
-          mkdir -p www
-          cp -R "$WEB_DIR"/. www/
+          mkdir -p /tmp/cap-www
 
-          npm init -y
-          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          rsync -a \
+            --exclude='node_modules' \
+            --exclude='android' \
+            --exclude='.git' \
+            "$WEB_DIR"/ /tmp/cap-www/
+
+          rm -rf www
+          mv /tmp/cap-www www
+
+          if [ ! -f package.json ]; then
+            npm init -y
+          fi
+
+          npm install @capacitor/core@6 \
+            @capacitor/cli@6 \
+            @capacitor/android@6
 
           cat > capacitor.config.json <<EOF
           {
@@ -206,7 +231,9 @@ jobs:
           set -euo pipefail
 
           if [ "${{ steps.detect.outputs.type }}" = "native" ]; then
-            GRADLE="$(find project -name gradlew -type f | head -n 1)"
+            GRADLE="$(find project -name gradlew -type f \
+              -not -path '*/node_modules/*' | head -n 1)"
+
             ANDROID_DIR="$(dirname "$GRADLE")"
           else
             ANDROID_DIR="project/android"
@@ -279,6 +306,7 @@ jobs:
 
       - name: Build summary
         if: success()
+        shell: bash
         run: |
           {
             echo "## APK Build Successful"
