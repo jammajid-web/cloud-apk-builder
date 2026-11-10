@@ -62,7 +62,7 @@ jobs:
   build:
     name: Build Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
       - name: Checkout Repository
@@ -103,16 +103,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-          cache-dependency-path: package-lock.json
-        continue-on-error: true
 
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
@@ -140,40 +136,62 @@ jobs:
 
           if [ -n "$CSS_B64" ]; then
             printf '%s' "$CSS_B64" | base64 --decode > /tmp/app-style.css
+
             python3 - <<'PY'
           from pathlib import Path
+          import re
+
           html = Path("www/index.html")
           content = html.read_text(encoding="utf-8")
           css = Path("/tmp/app-style.css").read_text(encoding="utf-8")
+
           style = "\n<style>\n" + css + "\n</style>\n"
-          if "</head>" in content.lower():
-              import re
-              content = re.sub(r"</head>", lambda m: style + m.group(0), content, count=1, flags=re.I)
+
+          if re.search(r"</head>", content, re.I):
+              content = re.sub(
+                  r"</head>",
+                  lambda m: style + m.group(0),
+                  content,
+                  count=1,
+                  flags=re.I
+              )
           else:
               content = style + content
+
           html.write_text(content, encoding="utf-8")
           PY
           fi
 
           if [ -n "$JS_B64" ]; then
             printf '%s' "$JS_B64" | base64 --decode > /tmp/app-script.js
+
             python3 - <<'PY'
           from pathlib import Path
+          import re
+
           html = Path("www/index.html")
           content = html.read_text(encoding="utf-8")
           js = Path("/tmp/app-script.js").read_text(encoding="utf-8")
+
           script = "\n<script>\n" + js + "\n</script>\n"
-          if "</body>" in content.lower():
-              import re
-              content = re.sub(r"</body>", lambda m: script + m.group(0), content, count=1, flags=re.I)
+
+          if re.search(r"</body>", content, re.I):
+              content = re.sub(
+                  r"</body>",
+                  lambda m: script + m.group(0),
+                  content,
+                  count=1,
+                  flags=re.I
+              )
           else:
               content += script
+
           html.write_text(content, encoding="utf-8")
           PY
           fi
 
           test -s www/index.html
-          echo "Web app prepared"
+          echo "Web app prepared successfully"
 
       - name: Install Capacitor
         run: |
@@ -206,6 +224,7 @@ jobs:
           ADMOB_TEST_MODE: ${{ inputs.admob_test_mode }}
         run: |
           set -e
+
           node <<'NODE'
           const fs = require('fs');
 
@@ -230,7 +249,7 @@ jobs:
             (testMode ? 'ca-app-pub-3940256099942544/1033173712' : '');
 
           if (!appId || !bannerId || !interstitialId) {
-            throw new Error('AdMob IDs are missing. Enable test mode or provide valid IDs.');
+            throw new Error('AdMob IDs are missing');
           }
 
           fs.writeFileSync(
@@ -260,6 +279,7 @@ jobs:
 
           cat > src/admob-bridge.js <<'JS'
           import { Capacitor } from '@capacitor/core';
+
           import {
             AdMob,
             BannerAdSize,
@@ -282,6 +302,7 @@ jobs:
 
               interstitialReady = true;
               console.log('Interstitial ready');
+
             } catch (error) {
               interstitialReady = false;
               console.error('Interstitial load failed:', error);
@@ -318,15 +339,11 @@ jobs:
                     isTesting: !!config.test_mode
                   });
 
-                  document.documentElement.style.setProperty(
-                    '--admob-banner-space',
-                    '60px'
-                  );
-
                   document.body.style.paddingBottom =
                     'calc(60px + env(safe-area-inset-bottom, 0px))';
 
                   console.log('Banner displayed');
+
                 } catch (error) {
                   console.error('Banner failed:', error);
                 }
@@ -336,6 +353,7 @@ jobs:
 
             } catch (error) {
               console.error('AdMob initialization failed:', error);
+
             } finally {
               initializing = false;
             }
@@ -350,6 +368,7 @@ jobs:
               await AdMob.showInterstitial();
               void loadInterstitial();
               return true;
+
             } catch (error) {
               console.error('Interstitial display failed:', error);
               void loadInterstitial();
@@ -387,6 +406,7 @@ jobs:
           ADMOB_APP_ID: ${{ env.ADMOB_APP_ID }}
         run: |
           set -e
+
           python3 <<'PY'
           import os
           import re
@@ -417,6 +437,8 @@ jobs:
 
           with open(path, "w", encoding="utf-8") as f:
               f.write(content)
+
+          print("AdMob manifest configured")
           PY
 
       - name: Prepare Custom Branding
@@ -439,7 +461,7 @@ jobs:
             npm install --save-dev @capacitor/assets@3
             npx capacitor-assets generate --android
           else
-            echo "No custom branding assets found; using default assets"
+            echo "No custom branding assets found"
           fi
 
       - name: Sync Android
@@ -449,6 +471,7 @@ jobs:
 
       - name: Configure Gradle
         run: |
+          set -e
           chmod +x android/gradlew
 
       - name: Build Android APK
@@ -461,6 +484,7 @@ jobs:
         shell: bash
         run: |
           set -e
+
           APK="android/app/build/outputs/apk/debug/app-debug.apk"
 
           if [ ! -s "$APK" ]; then
