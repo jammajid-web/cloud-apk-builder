@@ -145,35 +145,49 @@ jobs:
           path = Path("www/index.html")
           html = path.read_text(encoding="utf-8")
 
-          html = re.sub(
-              r'await\s+import\(\s*["\']https://esm\.sh/@capacitor/app@6\?bundle["\']\s*\)',
-              '({ App: window.ChatWaveNative.App })',
-              html
+          pattern = re.compile(
+              r"""(?:await\s*)?import\s*\(\s*(['"])"""
+              r"""https://esm\.sh/@capacitor/(app|browser)"""
+              r"""[^'"]*\1\s*\)""",
+              re.IGNORECASE
           )
 
-          html = re.sub(
-              r'await\s+import\(\s*["\']https://esm\.sh/@capacitor/browser@6\?bundle["\']\s*\)',
-              '({ Browser: window.ChatWaveNative.Browser })',
-              html
-          )
+          def replace_import(match):
+              plugin = match.group(2).lower()
+
+              if plugin == "app":
+                  return "Promise.resolve({ App: window.ChatWaveNative.App })"
+
+              return "Promise.resolve({ Browser: window.ChatWaveNative.Browser })"
+
+          html, count = pattern.subn(replace_import, html)
+
+          print(f"Replaced {count} remote Capacitor imports")
 
           if "chatwave-capacitor.js" not in html:
-              html = re.sub(
-                  r'</head>',
-                  '<script src="./chatwave-capacitor.js"></script>\n</head>',
-                  html,
-                  count=1,
-                  flags=re.IGNORECASE
+              script_tag = '<script src="./chatwave-capacitor.js"></script>'
+
+              if re.search(r"</head\s*>", html, re.IGNORECASE):
+                  html = re.sub(
+                      r"</head\s*>",
+                      script_tag + "\n</head>",
+                      html,
+                      count=1,
+                      flags=re.IGNORECASE
+                  )
+              else:
+                  raise SystemExit("ERROR: HTML head tag not found")
+
+          remaining = pattern.search(html)
+
+          if remaining:
+              raise SystemExit(
+                  "ERROR: Remote Capacitor dynamic import remains"
               )
 
-          if "https://esm.sh/@capacitor/app" in html:
-              raise SystemExit("ERROR: Remote Capacitor App import remains")
-
-          if "https://esm.sh/@capacitor/browser" in html:
-              raise SystemExit("ERROR: Remote Capacitor Browser import remains")
-
           path.write_text(html, encoding="utf-8")
-          print("ChatWave native imports patched successfully")
+
+          print("Native imports patched successfully")
           PY
 
       - name: Initialize Android project
