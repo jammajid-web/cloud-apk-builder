@@ -10,7 +10,10 @@ Future<void> main() async {
   var supabaseConfigured = false;
 
   if (url.startsWith('https://') && key.isNotEmpty) {
-    await Supabase.initialize(url: url, anonKey: key);
+    await Supabase.initialize(
+      url: url,
+      publishableKey: key,
+    );
     supabaseConfigured = true;
   }
 
@@ -61,20 +64,28 @@ class SetupScreen extends StatelessWidget {
                 mainAxisAlignment: MainAxisAlignment.center,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  const Icon(Icons.forum_rounded, size: 76,
-                      color: Color(0xFF27C7A5)),
+                  const Icon(
+                    Icons.forum_rounded,
+                    size: 76,
+                    color: Color(0xFF27C7A5),
+                  ),
                   const SizedBox(height: 20),
                   const Text(
                     'ChatWave',
                     textAlign: TextAlign.center,
-                    style: TextStyle(fontSize: 34,
-                        fontWeight: FontWeight.bold),
+                    style: TextStyle(
+                      fontSize: 34,
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                   const SizedBox(height: 8),
                   const Text(
                     'Messages that move with you.',
                     textAlign: TextAlign.center,
-                    style: TextStyle(color: Colors.white70, fontSize: 15),
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: 15,
+                    ),
                   ),
                   const SizedBox(height: 36),
                   FilledButton.icon(
@@ -86,17 +97,21 @@ class SetupScreen extends StatelessWidget {
                   Text(
                     supabaseConfigured
                         ? 'Supabase configuration detected. Authentication is the next milestone.'
-                        : 'Setup required: add your Supabase URL and publishable key to the .env file.',
+                        : 'Setup required: add your Supabase URL and publishable key.',
                     textAlign: TextAlign.center,
                     style: const TextStyle(
-                        color: Colors.white60, height: 1.5),
+                      color: Colors.white60,
+                      height: 1.5,
+                    ),
                   ),
                   const SizedBox(height: 28),
                   const Text(
                     'Flutter + Dart + Supabase',
                     textAlign: TextAlign.center,
                     style: TextStyle(
-                        color: Color(0xFF27C7A5), fontSize: 12),
+                      color: Color(0xFF27C7A5),
+                      fontSize: 12,
+                    ),
                   ),
                 ],
               ),
