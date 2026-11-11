@@ -44,7 +44,7 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platform-tools'
+          packages: platform-tools
 
       - name: Install build tools
         run: |
@@ -65,29 +65,29 @@ jobs:
 
           ZIP_FILE="source/ChatWave-Improved-Source.zip"
 
-          if [ ! -f "$ZIP_FILE" ]; then
-            echo "ERROR: Improved source ZIP not found"
+          test -f "$ZIP_FILE" || {
+            echo "ERROR: ChatWave-Improved-Source.zip not found"
             exit 1
-          fi
+          }
 
           unzip -q "$ZIP_FILE" -d extracted
 
-          HTML_FILE=$(find extracted -type f -name "index.html" | head -n 1)
+          HTML_FILE=$(find extracted -type f -name index.html | head -n 1)
 
-          if [ -z "$HTML_FILE" ]; then
-            echo "ERROR: index.html not found in source ZIP"
+          test -n "$HTML_FILE" || {
+            echo "ERROR: index.html not found"
             exit 1
-          fi
+          }
 
-          echo "ChatWave improved source extracted successfully"
+          echo "Source downloaded successfully"
 
       - name: Detect app source
         id: detect
         run: |
-          HTML_FILE=$(find extracted -type f -name "index.html" | head -n 1)
+          HTML_FILE=$(find extracted -type f -name index.html | head -n 1)
 
           if [ -z "$HTML_FILE" ]; then
-            echo "ERROR: index.html not found"
+            echo "index.html missing"
             exit 1
           fi
 
@@ -121,7 +121,7 @@ jobs:
           }
           EOF
 
-      - name: Bundle native Capacitor plugins
+      - name: Bundle Capacitor plugins
         run: |
           cat > native-entry.js <<'EOF'
           import { App } from '@capacitor/app';
@@ -142,7 +142,7 @@ jobs:
             --target=es2020 \
             --outfile=www/chatwave-capacitor.js
 
-      - name: Patch ChatWave native imports
+      - name: Patch Capacitor imports
         run: |
           python3 <<'PY'
           from pathlib import Path
@@ -159,77 +159,75 @@ jobs:
           )
 
           def replace_import(match):
-              plugin = match.group(2).lower()
+              name = match.group(2).lower()
 
-              if plugin == "app":
+              if name == "app":
                   return "Promise.resolve({ App: window.ChatWaveNative.App })"
 
-              if plugin == "browser":
+              if name == "browser":
                   return "Promise.resolve({ Browser: window.ChatWaveNative.Browser })"
 
               return "Promise.resolve({ registerPlugin: window.ChatWaveNative.registerPlugin })"
 
           html, count = pattern.subn(replace_import, html)
-
-          print(f"Replaced {count} Capacitor imports")
+          print("Capacitor imports replaced:", count)
 
           if "chatwave-capacitor.js" not in html:
-              script_tag = '<script src="./chatwave-capacitor.js"></script>'
+              script = '<script src="./chatwave-capacitor.js"></script>'
 
-              if re.search(r"</head\s*>", html, re.IGNORECASE):
+              if re.search(r"</head\s*>", html, re.I):
                   html = re.sub(
                       r"</head\s*>",
-                      script_tag + "\n</head>",
+                      script + "\n</head>",
                       html,
                       count=1,
-                      flags=re.IGNORECASE
+                      flags=re.I
                   )
               else:
-                  raise SystemExit("ERROR: HTML head tag not found")
+                  raise SystemExit("HTML head tag not found")
 
           if pattern.search(html):
-              raise SystemExit("ERROR: Remote Capacitor import remains")
+              raise SystemExit("Remote Capacitor imports remain")
 
           path.write_text(html, encoding="utf-8")
           PY
 
-      - name: Initialize Android project
+      - name: Initialize Android
         run: |
           npx cap add android
           npx cap sync android
 
-      - name: Install native microphone and camera plugin
+      - name: Install microphone and camera plugin
         run: |
           python3 <<'PY'
           from pathlib import Path
           import re
 
-          main_files = list(
+          files = list(
               Path("android/app/src/main").rglob("MainActivity.java")
           )
 
-          if not main_files:
-              raise SystemExit("ERROR: MainActivity.java not found")
+          if not files:
+              raise SystemExit("MainActivity.java not found")
 
-          main_file = main_files[0]
-          main_text = main_file.read_text(encoding="utf-8")
+          main_file = files[0]
+          source = main_file.read_text(encoding="utf-8")
 
           package_match = re.search(
-              r"^\s*package\s+([a-zA-Z0-9_.]+)\s*;",
-              main_text,
+              r"^\s*package\s+([A-Za-z0-9_.]+)\s*;",
+              source,
               re.MULTILINE
           )
 
           if not package_match:
-              raise SystemExit("ERROR: Android package not found")
+              raise SystemExit("Android package not found")
 
           package_name = package_match.group(1)
 
-          plugin_code = """
+          plugin = r'''
           package PACKAGE_NAME;
 
           import android.Manifest;
-
           import com.getcapacitor.JSObject;
           import com.getcapacitor.Plugin;
           import com.getcapacitor.PluginCall;
@@ -274,101 +272,117 @@ jobs:
               @PluginMethod
               public void requestMicrophone(PluginCall call) {
                   requestPermissionForAlias(
-                      "microphone",
-                      call,
-                      "microphoneCallback"
+                      "microphone", call, "microphoneCallback"
                   );
               }
 
               @PluginMethod
               public void requestCamera(PluginCall call) {
                   requestPermissionForAlias(
-                      "camera",
-                      call,
-                      "cameraCallback"
+                      "camera", call, "cameraCallback"
                   );
               }
 
               @PermissionCallback
               private void permissionsCallback(PluginCall call) {
                   JSObject result = new JSObject();
-
                   result.put(
                       "microphone",
                       getPermissionState("microphone").toString().equals("granted")
                   );
-
                   result.put(
                       "camera",
                       getPermissionState("camera").toString().equals("granted")
                   );
-
                   call.resolve(result);
               }
 
               @PermissionCallback
               private void microphoneCallback(PluginCall call) {
                   JSObject result = new JSObject();
-
                   result.put(
                       "microphone",
                       getPermissionState("microphone").toString().equals("granted")
                   );
-
                   call.resolve(result);
               }
 
               @PermissionCallback
               private void cameraCallback(PluginCall call) {
                   JSObject result = new JSObject();
-
                   result.put(
                       "camera",
                       getPermissionState("camera").toString().equals("granted")
                   );
-
                   call.resolve(result);
               }
           }
-          """
+          '''
 
-          plugin_code = plugin_code.replace(
-              "PACKAGE_NAME",
-              package_name
-          )
+          plugin = plugin.replace("PACKAGE_NAME", package_name)
 
           plugin_file = main_file.parent / "MediaPermissionsPlugin.java"
-          plugin_file.write_text(
-              plugin_code.strip() + "\n",
-              encoding="utf-8"
-          )
+          plugin_file.write_text(plugin.strip() + "\n", encoding="utf-8")
 
-          if "MediaPermissionsPlugin.class" not in main_text:
-              if "super.onCreate(savedInstanceState);" in main_text:
-                  main_text = main_text.replace(
+          if "MediaPermissionsPlugin.class" not in source:
+              if "import android.os.Bundle;" not in source:
+                  source = source.replace(
+                      package_match.group(0),
+                      package_match.group(0) +
+                      "\n\nimport android.os.Bundle;",
+                      1
+                  )
+
+              if "super.onCreate(savedInstanceState);" in source:
+                  source = source.replace(
                       "super.onCreate(savedInstanceState);",
                       "registerPlugin(MediaPermissionsPlugin.class);\n"
                       "        super.onCreate(savedInstanceState);",
                       1
                   )
               else:
-                  raise SystemExit(
-                      "ERROR: MainActivity onCreate method not found"
+                  class_open = re.search(
+                      r"public\s+class\s+MainActivity\s+extends\s+BridgeActivity\s*\{",
+                      source
                   )
 
-              main_file.write_text(main_text, encoding="utf-8")
+                  if not class_open:
+                      raise SystemExit(
+                          "Unsupported MainActivity structure"
+                      )
 
-          print("MediaPermissions plugin created and registered")
+                  method = """
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(MediaPermissionsPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+          """
+
+                  source = (
+                      source[:class_open.end()]
+                      + "\n"
+                      + method
+                      + "\n"
+                      + source[class_open.end():]
+                  )
+
+              main_file.write_text(source, encoding="utf-8")
+
+          print("MediaPermissions plugin installed")
           PY
 
-      - name: Configure Android permissions and app icon
+      - name: Configure Android permissions and icon
         run: |
           python3 <<'PY'
           from pathlib import Path
           import re
 
-          path = Path("android/app/src/main/AndroidManifest.xml")
-          xml = path.read_text(encoding="utf-8")
+          manifest = Path(
+              "android/app/src/main/AndroidManifest.xml"
+          )
+
+          xml = manifest.read_text(encoding="utf-8")
 
           permissions = [
               "android.permission.RECORD_AUDIO",
@@ -377,36 +391,31 @@ jobs:
           ]
 
           for permission in permissions:
-              entry = f'<uses-permission android:name="{permission}" />'
-
               if permission not in xml:
                   xml = xml.replace(
                       "<application",
-                      entry + "\n    <application",
+                      f'<uses-permission android:name="{permission}" />\n'
+                      "<application",
                       1
                   )
 
-          app_match = re.search(r'<application\b[^>]*>', xml)
+          match = re.search(r"<application\b[^>]*>", xml)
 
-          if not app_match:
-              raise SystemExit("Android application tag not found")
+          if not match:
+              raise SystemExit("Application tag not found")
 
-          app_tag = app_match.group(0)
+          tag = match.group(0)
 
-          for attribute in ("icon", "roundIcon"):
-              pattern = rf'\s+android:{attribute}="[^"]*"'
-              replacement = f' android:{attribute}="@drawable/chatwave_icon"'
+          for attr in ("icon", "roundIcon"):
+              pattern = rf'\s+android:{attr}="[^"]*"'
+              value = f' android:{attr}="@drawable/chatwave_icon"'
 
-              if re.search(pattern, app_tag):
-                  app_tag = re.sub(pattern, replacement, app_tag)
+              if re.search(pattern, tag):
+                  tag = re.sub(pattern, value, tag)
               else:
-                  app_tag = app_tag[:-1] + replacement + ">"
+                  tag = tag[:-1] + value + ">"
 
-          xml = (
-              xml[:app_match.start()]
-              + app_tag
-              + xml[app_match.end():]
-          )
+          xml = xml[:match.start()] + tag + xml[match.end():]
 
           if 'android:scheme="com.chatwave.app"' not in xml:
               intent_filter = """
@@ -422,11 +431,11 @@ jobs:
 
               xml = xml.replace(
                   "</activity>",
-                  intent_filter + "\n    </activity>",
+                  intent_filter + "\n</activity>",
                   1
               )
 
-          path.write_text(xml, encoding="utf-8")
+          manifest.write_text(xml, encoding="utf-8")
 
           icon = Path(
               "android/app/src/main/res/drawable/chatwave_icon.xml"
@@ -447,7 +456,7 @@ jobs:
           </vector>
           """, encoding="utf-8")
 
-          print("Android permissions, deep link and icon configured")
+          print("Permissions, icon and OAuth deep link configured")
           PY
 
       - name: Apply app configuration
@@ -462,10 +471,9 @@ jobs:
 
           if raw:
               config = json.loads(raw)
-              print("App configuration received")
-              print(json.dumps(config, indent=2))
+              print("Configuration JSON is valid")
           else:
-              print("Using default ChatWave configuration")
+              print("Using default configuration")
           PY
 
       - name: Build Android APK
@@ -479,7 +487,7 @@ jobs:
           APK="android/app/build/outputs/apk/debug/app-debug.apk"
 
           if [ ! -f "$APK" ]; then
-            echo "ERROR: APK file was not generated"
+            echo "APK not generated"
             exit 1
           fi
 
@@ -493,7 +501,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish APK release
+      - name: Publish APK to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag }}
