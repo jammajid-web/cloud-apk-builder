@@ -201,6 +201,7 @@ jobs:
           APP_NAME: ${{ steps.config.outputs.app_name }}
           PACKAGE_ID: ${{ steps.config.outputs.package_id }}
           SPLASH_BG: ${{ steps.config.outputs.splash_background }}
+          SPLASH_DURATION: ${{ steps.config.outputs.splash_duration }}
         run: |
           set -euo pipefail
 
@@ -209,7 +210,9 @@ jobs:
 
           cd project
           npm init -y
+
           npm install @capacitor/core@6 @capacitor/android@6
+          npm install @capacitor/app@6 @capacitor/browser@6
           npm install --save-dev @capacitor/cli@6
 
           cat > capacitor.config.json <<EOF
@@ -219,7 +222,7 @@ jobs:
             "webDir": "www",
             "plugins": {
               "SplashScreen": {
-                "launchShowDuration": ${{ steps.config.outputs.splash_duration }},
+                "launchShowDuration": $SPLASH_DURATION,
                 "launchAutoHide": true,
                 "backgroundColor": "$SPLASH_BG",
                 "showSpinner": false,
@@ -230,6 +233,70 @@ jobs:
           EOF
 
           npx cap add android
+
+          python3 - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          manifest = "android/app/src/main/AndroidManifest.xml"
+          android = "{http://schemas.android.com/apk/res/android}"
+
+          ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+
+          tree = ET.parse(manifest)
+          root = tree.getroot()
+
+          activity = None
+
+          for item in root.findall(".//activity"):
+              name = item.get(android + "name", "")
+              if "MainActivity" in name or "BridgeActivity" in name:
+                  activity = item
+                  break
+
+          if activity is None:
+              raise SystemExit("MainActivity not found in AndroidManifest.xml")
+
+          activity.set(android + "launchMode", "singleTask")
+          activity.set(android + "exported", "true")
+
+          scheme = os.environ["PACKAGE_ID"]
+          host = "login-callback"
+
+          exists = False
+
+          for intent in activity.findall("intent-filter"):
+              for data in intent.findall("data"):
+                  if data.get(android + "scheme") == scheme and data.get(android + "host") == host:
+                      exists = True
+                      break
+
+          if not exists:
+              intent = ET.SubElement(activity, "intent-filter")
+
+              ET.SubElement(intent, "action", {
+                  android + "name": "android.intent.action.VIEW"
+              })
+
+              ET.SubElement(intent, "category", {
+                  android + "name": "android.intent.category.DEFAULT"
+              })
+
+              ET.SubElement(intent, "category", {
+                  android + "name": "android.intent.category.BROWSABLE"
+              })
+
+              ET.SubElement(intent, "data", {
+                  android + "scheme": scheme,
+                  android + "host": host
+              })
+
+          tree.write(manifest, encoding="utf-8", xml_declaration=True)
+
+          print("Android OAuth deep link configured.")
+          PY
+
+          npx cap sync android
 
       - name: Install backend and AdMob packages
         if: steps.project.outputs.type == 'web'
@@ -548,7 +615,6 @@ jobs:
           if not res_dir.exists():
               raise SystemExit(f"Android app resources directory not found: {res_dir}")
 
-          # Optional custom icon is expected inside the uploaded source ZIP.
           custom_icon = None
 
           for candidate in pathlib.Path("source").rglob("custom-icon.png"):
@@ -617,7 +683,6 @@ jobs:
               icon.save(path / "ic_launcher.png")
               icon.save(path / "ic_launcher_round.png")
 
-          # Remove adaptive XML so Android uses the generated PNG icons.
           adaptive_dir = res_dir / "mipmap-anydpi-v26"
 
           for filename in ("ic_launcher.xml", "ic_launcher_round.xml"):
@@ -625,7 +690,6 @@ jobs:
               if adaptive_file.exists():
                   adaptive_file.unlink()
 
-          # Generate splash artwork for web projects.
           if project_type == "web":
               splash_dir = res_dir / "drawable"
               splash_dir.mkdir(parents=True, exist_ok=True)
