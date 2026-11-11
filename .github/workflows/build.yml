@@ -1,907 +1,286 @@
-
 name: Advanced Cloud APK Builder
-
-run-name: APK Builder - ${{ inputs.run_id }}
 
 on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: Builder request ID
-        required: true
+        description: "Build run ID"
+        required: false
         type: string
       release_tag:
-        description: Draft GitHub Release tag
+        description: "Source release tag"
         required: true
         type: string
       manifest_json:
-        description: Builder configuration JSON
-        required: true
+        description: "App configuration JSON"
+        required: false
         type: string
 
 permissions:
   contents: write
   actions: read
 
-concurrency:
-  group: apk-builder-${{ inputs.run_id }}
-  cancel-in-progress: false
-
 jobs:
   build:
-    name: Build Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate manifest
-        id: config
-        env:
-          MANIFEST_JSON: ${{ inputs.manifest_json }}
-        run: |
-          python3 - <<'PY'
-          import json, os, re, sys
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
-          try:
-              m = json.loads(os.environ["MANIFEST_JSON"])
-          except Exception as e:
-              sys.exit("Invalid manifest JSON: " + str(e))
-
-          name = str(m.get("app_name", "")).strip()
-          package = str(m.get("package_id", "")).strip()
-          version = str(m.get("version", "")).strip()
-          code = m.get("version_code")
-
-          if not name or len(name) > 80:
-              sys.exit("App name is required (maximum 80 characters).")
-          if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+", package):
-              sys.exit("Invalid Android package ID.")
-          if not version or not re.fullmatch(r"[A-Za-z0-9._+-]+", version):
-              sys.exit("Invalid app version.")
-          if not isinstance(code, int) or isinstance(code, bool) or code < 1:
-              sys.exit("Version code must be a positive integer.")
-
-          backend = m.get("backend") or {}
-          provider = backend.get("provider", "none")
-          if provider not in ("none", "supabase", "firebase"):
-              sys.exit("Unsupported backend provider.")
-
-          admob = m.get("admob") or {}
-          branding = m.get("branding") or {}
-
-          for key in ("primary_color", "secondary_color", "splash_background"):
-              value = branding.get(key, "#ffffff")
-              if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(value)):
-                  sys.exit("Invalid branding color: " + key)
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write("app_name=" + name.replace("%", "%25").replace("\n", "%0A") + "\n")
-              f.write("package_id=" + package + "\n")
-              f.write("version=" + version + "\n")
-              f.write("version_code=" + str(code) + "\n")
-              f.write("backend=" + provider + "\n")
-              f.write("admob_enabled=" + str(bool(admob.get("enabled"))).lower() + "\n")
-              f.write("splash_duration=" + str(max(0, min(10000, int(branding.get("splash_duration", 2500) or 0)))) + "\n")
-              f.write("splash_background=" + str(branding.get("splash_background", "#ffffff")) + "\n")
-          PY
-
-      - name: Set up Java 17
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: 'platform-tools'
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK components
+      - name: Install build tools
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          sudo apt-get update
+          sudo apt-get install -y unzip zip python3
 
-      - name: Download source ZIP from draft release
+      - name: Download source ZIP
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.release_tag }}
-          REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          set -euo pipefail
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "*.zip" \
+            --dir source
 
-          RELEASES=$(curl -fsSL \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/releases?per_page=100")
+          ZIP_FILE=$(find source -maxdepth 1 -name "*.zip" | head -n 1)
 
-          RELEASE=$(echo "$RELEASES" | jq -c \
-            --arg tag "$TAG" \
-            '[.[] | select(.tag_name == $tag)][0] // empty')
-
-          if [ -z "$RELEASE" ]; then
-            echo "Draft release not found: $TAG"
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: Source ZIP not found"
             exit 1
           fi
 
-          ASSET_ID=$(echo "$RELEASE" | jq -r \
-            '.assets[] | select(.name=="source.zip") | .id' | head -n 1)
+          mkdir -p extracted
+          unzip -q "$ZIP_FILE" -d extracted
 
-          if [ -z "$ASSET_ID" ] || [ "$ASSET_ID" = "null" ]; then
-            echo "source.zip not found in release."
+      - name: Detect app source
+        id: detect
+        run: |
+          HTML_FILE=$(find extracted -type f -name "index.html" | head -n 1)
+
+          if [ -z "$HTML_FILE" ]; then
+            echo "ERROR: index.html not found in source ZIP"
             exit 1
           fi
 
-          curl -fL \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/octet-stream" \
-            "https://api.github.com/repos/$REPO/releases/assets/$ASSET_ID" \
-            -o source.zip
+          echo "html_file=$HTML_FILE" >> "$GITHUB_OUTPUT"
 
-          test -s source.zip
-
-      - name: Safely extract source ZIP
+      - name: Prepare web assets
         run: |
-          python3 - <<'PY'
-          import zipfile, os, shutil, stat, sys
+          mkdir -p www
 
-          target = "source"
-          shutil.rmtree(target, ignore_errors=True)
-          os.makedirs(target, exist_ok=True)
-          total = 0
-          limit = 400 * 1024 * 1024
+          cp -R "$(dirname "${{ steps.detect.outputs.html_file }}")"/. www/
 
-          with zipfile.ZipFile("source.zip") as z:
-              for item in z.infolist():
-                  name = item.filename.replace("\\", "/")
-                  parts = name.split("/")
-                  mode = (item.external_attr >> 16) & 0xFFFF
+          test -f www/index.html || {
+            echo "ERROR: www/index.html missing"
+            exit 1
+          }
 
-                  if name.startswith("/") or ".." in parts:
-                      sys.exit("Unsafe ZIP path found.")
-                  if stat.S_ISLNK(mode):
-                      sys.exit("Symbolic links are not allowed.")
-                  total += item.file_size
-                  if total > limit:
-                      sys.exit("Extracted ZIP exceeds 400 MB.")
-
-              z.extractall(target)
-
-          print("Source ZIP extracted.")
-          PY
-
-      - name: Detect project type
-        id: project
+      - name: Install Capacitor dependencies
         run: |
-          set -euo pipefail
-
-          GRADLE=$(find source -maxdepth 5 -type f -name gradlew | head -n 1 || true)
-
-          if [ -n "$GRADLE" ]; then
-            ROOT=$(dirname "$GRADLE")
-            echo "type=native" >> "$GITHUB_OUTPUT"
-            echo "root=$ROOT" >> "$GITHUB_OUTPUT"
-          else
-            INDEX=$(find source -maxdepth 5 -type f -name index.html | head -n 1 || true)
-
-            if [ -z "$INDEX" ]; then
-              echo "No index.html or Gradle Android project found."
-              exit 1
-            fi
-
-            echo "type=web" >> "$GITHUB_OUTPUT"
-            echo "root=$(dirname "$INDEX")" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Prepare Capacitor project
-        if: steps.project.outputs.type == 'web'
-        env:
-          APP_NAME: ${{ steps.config.outputs.app_name }}
-          PACKAGE_ID: ${{ steps.config.outputs.package_id }}
-          SPLASH_BG: ${{ steps.config.outputs.splash_background }}
-          SPLASH_DURATION: ${{ steps.config.outputs.splash_duration }}
-        run: |
-          set -euo pipefail
-
-          mkdir -p project/www
-          cp -R "${{ steps.project.outputs.root }}/." project/www/
-
-          cd project
           npm init -y
-
-          npm install @capacitor/core@6 @capacitor/android@6
+          npm install @capacitor/core@6 @capacitor/cli@6
+          npm install @capacitor/android@6
           npm install @capacitor/app@6 @capacitor/browser@6
-          npm install --save-dev @capacitor/cli@6
+          npm install esbuild
 
-          cat > capacitor.config.json <<EOF
+      - name: Configure Capacitor
+        run: |
+          cat > capacitor.config.json <<'EOF'
           {
-            "appId": "$PACKAGE_ID",
-            "appName": $(python3 -c 'import json,os; print(json.dumps(os.environ["APP_NAME"]))'),
+            "appId": "com.chatwave.app",
+            "appName": "ChatWave",
             "webDir": "www",
-            "plugins": {
-              "SplashScreen": {
-                "launchShowDuration": $SPLASH_DURATION,
-                "launchAutoHide": true,
-                "backgroundColor": "$SPLASH_BG",
-                "showSpinner": false,
-                "androidScaleType": "CENTER_INSIDE"
-              }
+            "bundledWebRuntime": false,
+            "server": {
+              "androidScheme": "https"
             }
           }
           EOF
 
-          npx cap add android
+      - name: Bundle native Capacitor plugins
+        run: |
+          mkdir -p www
 
-          python3 - <<'PY'
-          import os
-          import xml.etree.ElementTree as ET
+          cat > native-entry.js <<'EOF'
+          import { App } from '@capacitor/app';
+          import { Browser } from '@capacitor/browser';
 
-          manifest = "android/app/src/main/AndroidManifest.xml"
-          android = "{http://schemas.android.com/apk/res/android}"
+          window.ChatWaveNative = {
+            App,
+            Browser
+          };
+          EOF
 
-          ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+          npx esbuild native-entry.js \
+            --bundle \
+            --format=iife \
+            --platform=browser \
+            --target=es2020 \
+            --outfile=www/chatwave-capacitor.js
 
-          tree = ET.parse(manifest)
-          root = tree.getroot()
+      - name: Patch ChatWave native imports
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
 
-          activity = None
+          path = Path("www/index.html")
+          html = path.read_text(encoding="utf-8")
 
-          for item in root.findall(".//activity"):
-              name = item.get(android + "name", "")
-              if "MainActivity" in name or "BridgeActivity" in name:
-                  activity = item
-                  break
+          html = re.sub(
+              r'await\s+import\(\s*["\']https://esm\.sh/@capacitor/app@6\?bundle["\']\s*\)',
+              '({ App: window.ChatWaveNative.App })',
+              html
+          )
 
-          if activity is None:
-              raise SystemExit("MainActivity not found in AndroidManifest.xml")
+          html = re.sub(
+              r'await\s+import\(\s*["\']https://esm\.sh/@capacitor/browser@6\?bundle["\']\s*\)',
+              '({ Browser: window.ChatWaveNative.Browser })',
+              html
+          )
 
-          activity.set(android + "launchMode", "singleTask")
-          activity.set(android + "exported", "true")
+          if "chatwave-capacitor.js" not in html:
+              html = re.sub(
+                  r'</head>',
+                  '<script src="./chatwave-capacitor.js"></script>\n</head>',
+                  html,
+                  count=1,
+                  flags=re.IGNORECASE
+              )
 
-          scheme = os.environ["PACKAGE_ID"]
-          host = "login-callback"
+          if "https://esm.sh/@capacitor/app" in html:
+              raise SystemExit("ERROR: Remote Capacitor App import remains")
 
-          exists = False
+          if "https://esm.sh/@capacitor/browser" in html:
+              raise SystemExit("ERROR: Remote Capacitor Browser import remains")
 
-          for intent in activity.findall("intent-filter"):
-              for data in intent.findall("data"):
-                  if data.get(android + "scheme") == scheme and data.get(android + "host") == host:
-                      exists = True
-                      break
-
-          if not exists:
-              intent = ET.SubElement(activity, "intent-filter")
-
-              ET.SubElement(intent, "action", {
-                  android + "name": "android.intent.action.VIEW"
-              })
-
-              ET.SubElement(intent, "category", {
-                  android + "name": "android.intent.category.DEFAULT"
-              })
-
-              ET.SubElement(intent, "category", {
-                  android + "name": "android.intent.category.BROWSABLE"
-              })
-
-              ET.SubElement(intent, "data", {
-                  android + "scheme": scheme,
-                  android + "host": host
-              })
-
-          tree.write(manifest, encoding="utf-8", xml_declaration=True)
-
-          print("Android OAuth deep link configured.")
+          path.write_text(html, encoding="utf-8")
+          print("ChatWave native imports patched successfully")
           PY
-
+                - name: Initialize Android project
+        run: |
+          npx cap add android
           npx cap sync android
 
-      - name: Install backend and AdMob packages
-        if: steps.project.outputs.type == 'web'
+      - name: Apply app configuration
         env:
           MANIFEST_JSON: ${{ inputs.manifest_json }}
-        working-directory: project
-        id: packages
         run: |
-          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
 
-          python3 - <<'PY'
-          import json, os
+          raw = os.environ.get("MANIFEST_JSON", "").strip()
 
-          m = json.loads(os.environ["MANIFEST_JSON"])
-          backend = (m.get("backend") or {}).get("provider", "none")
-          admob = bool((m.get("admob") or {}).get("enabled"))
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write("backend=" + backend + "\n")
-              f.write("admob=" + str(admob).lower() + "\n")
-          PY
-
-      - name: Install Supabase SDK
-        if: steps.project.outputs.type == 'web' && steps.packages.outputs.backend == 'supabase'
-        working-directory: project
-        run: npm install @supabase/supabase-js@2
-
-      - name: Install Firebase SDK
-        if: steps.project.outputs.type == 'web' && steps.packages.outputs.backend == 'firebase'
-        working-directory: project
-        run: npm install firebase@^10
-
-      - name: Install AdMob plugin
-        if: steps.project.outputs.type == 'web' && steps.packages.outputs.admob == 'true'
-        working-directory: project
-        run: npm install @capacitor-community/admob@6
-
-      - name: Create backend and AdMob runtimes
-        if: steps.project.outputs.type == 'web'
-        env:
-          MANIFEST_JSON: ${{ inputs.manifest_json }}
-        working-directory: project
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import json, os, pathlib
-
-          m = json.loads(os.environ["MANIFEST_JSON"])
-          backend = m.get("backend") or {}
-          provider = backend.get("provider", "none")
-          admob = m.get("admob") or {}
-          www = pathlib.Path("www")
-          www.mkdir(exist_ok=True)
-
-          if provider == "supabase":
-              cfg = backend.get("supabase") or {}
-              if not cfg.get("url") or not (cfg.get("publishable_key") or cfg.get("anon_key")):
-                  raise SystemExit("Supabase URL and public client key are required.")
-
-              source = """
-          import { createClient } from '@supabase/supabase-js';
-          const cfg = __BACKEND_CONFIG__;
-          const s = cfg.supabase || {};
-          const client = createClient(s.url, s.publishable_key || s.anon_key);
-          window.BuilderBackend = {
-            provider: 'supabase',
-            supabase: client,
-            features: s.features || {}
-          };
-          """
-
-              config = {"supabase": cfg}
-              pathlib.Path("backend-runtime.js").write_text(
-                  source.replace("__BACKEND_CONFIG__", json.dumps(config))
-              )
-
-          elif provider == "firebase":
-              cfg = backend.get("firebase") or {}
-              firebase_config = cfg.get("config") or {}
-
-              if not firebase_config.get("apiKey") or not firebase_config.get("projectId") or not firebase_config.get("appId"):
-                  raise SystemExit("Firebase Web config requires apiKey, projectId and appId.")
-
-              source = """
-          import { initializeApp, getApps } from 'firebase/app';
-          import { getAuth } from 'firebase/auth';
-          import { getFirestore } from 'firebase/firestore';
-          import { getStorage } from 'firebase/storage';
-
-          const cfg = __FIREBASE_CONFIG__;
-          const app = getApps().length ? getApps()[0] : initializeApp(cfg);
-
-          window.BuilderBackend = {
-            provider: 'firebase',
-            app,
-            auth: getAuth(app),
-            firestore: getFirestore(app),
-            storage: getStorage(app),
-            features: __FIREBASE_FEATURES__
-          };
-          """
-
-              source = source.replace("__FIREBASE_CONFIG__", json.dumps(firebase_config))
-              source = source.replace("__FIREBASE_FEATURES__", json.dumps(cfg.get("features") or {}))
-              pathlib.Path("backend-runtime.js").write_text(source)
-
-          if admob.get("enabled"):
-              test_mode = bool(admob.get("test_mode", True))
-              app_id = admob.get("app_id", "").strip()
-              banner = admob.get("banner_id", "").strip()
-              interstitial = admob.get("interstitial_id", "").strip()
-              rewarded = admob.get("rewarded_id", "").strip()
-
-              if test_mode:
-                  app_id = app_id or "ca-app-pub-3940256099942544~3347511713"
-                  banner = banner or "ca-app-pub-3940256099942544/6300978111"
-                  interstitial = interstitial or "ca-app-pub-3940256099942544/1033173712"
-                  rewarded = rewarded or "ca-app-pub-3940256099942544/5224354917"
-              elif not app_id:
-                  raise SystemExit("Live AdMob requires an AdMob App ID.")
-
-              if not any((banner, interstitial, rewarded)):
-                  raise SystemExit("Enable at least one AdMob ad unit.")
-
-              source = """
-          import { Capacitor } from '@capacitor/core';
-          import {
-            AdMob, BannerAdSize, BannerAdPosition, AdmobConsentStatus
-          } from '@capacitor-community/admob';
-
-          const cfg = __ADMOB_CONFIG__;
-          let interstitialCount = 0;
-          let initialized = false;
-
-          async function initializeAds() {
-            if (initialized || !Capacitor.isNativePlatform()) return;
-            initialized = true;
-
-            try {
-              let consentInfo = await AdMob.requestConsentInfo();
-
-              if (consentInfo.isConsentFormAvailable &&
-                  consentInfo.status === AdmobConsentStatus.REQUIRED) {
-                consentInfo = await AdMob.showConsentForm();
-              }
-
-              if (consentInfo.status === AdmobConsentStatus.REQUIRED ||
-                  consentInfo.status === AdmobConsentStatus.UNKNOWN) {
-                console.warn('AdMob consent is not ready; ads were not requested.');
-                return;
-              }
-
-              await AdMob.initialize({
-                initializeForTesting: cfg.testMode,
-                requestTrackingAuthorization: true
-              });
-
-              if (cfg.banner) {
-                await AdMob.showBanner({
-                  adId: cfg.banner,
-                  adSize: BannerAdSize.ADAPTIVE_BANNER,
-                  position: BannerAdPosition.BOTTOM_CENTER,
-                  isTesting: cfg.testMode
-                });
-              }
-
-              console.log('AdMob initialized.');
-            } catch (error) {
-              console.error('AdMob initialization failed:', error);
-            }
-          }
-
-          window.BuilderShowInterstitial = async function() {
-            if (!cfg.interstitial || !Capacitor.isNativePlatform()) return;
-
-            try {
-              await AdMob.prepareInterstitial({
-                adId: cfg.interstitial,
-                isTesting: cfg.testMode
-              });
-              await AdMob.showInterstitial();
-            } catch (error) {
-              console.warn('Interstitial ad:', error);
-            }
-          };
-
-          window.BuilderShowRewarded = async function() {
-            if (!cfg.rewarded || !Capacitor.isNativePlatform()) return null;
-
-            try {
-              await AdMob.prepareRewardVideoAd({
-                adId: cfg.rewarded,
-                isTesting: cfg.testMode
-              });
-              return await AdMob.showRewardVideoAd();
-            } catch (error) {
-              console.warn('Rewarded ad:', error);
-              return null;
-            }
-          };
-
-          window.addEventListener('builder-interstitial', () => {
-            interstitialCount++;
-
-            if (cfg.frequency > 0 && interstitialCount % cfg.frequency === 0) {
-              window.BuilderShowInterstitial();
-            }
-          });
-
-          if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', initializeAds, { once: true });
-          } else {
-            initializeAds();
-          }
-          """
-
-              config = {
-                  "appId": app_id,
-                  "banner": banner,
-                  "interstitial": interstitial,
-                  "rewarded": rewarded,
-                  "testMode": test_mode,
-                  "frequency": max(0, int(admob.get("frequency", 3) or 0))
-              }
-
-              pathlib.Path("admob-runtime.js").write_text(
-                  source.replace("__ADMOB_CONFIG__", json.dumps(config))
-              )
-
-          (pathlib.Path("www") / "builder-backend-info.json").write_text(
-              json.dumps({"provider": provider})
-          )
-          PY
-
-          if [ -f backend-runtime.js ]; then
-            npx esbuild backend-runtime.js --bundle --platform=browser --format=iife --outfile=www/builder-backend-runtime.js
-          fi
-
-          if [ -f admob-runtime.js ]; then
-            npx esbuild admob-runtime.js --bundle --platform=browser --format=iife --outfile=www/builder-admob-runtime.js
-          fi
-
-          python3 - <<'PY'
-          import pathlib
-
-          index = pathlib.Path("www/index.html")
-          if not index.exists():
-              raise SystemExit("www/index.html is missing.")
-
-          html = index.read_text(errors="replace")
-          tags = ""
-
-          if pathlib.Path("www/builder-backend-runtime.js").exists():
-              tags += '<script src="builder-backend-runtime.js"></script>'
-
-          if pathlib.Path("www/builder-admob-runtime.js").exists():
-              tags += '<script src="builder-admob-runtime.js"></script>'
-
-          if tags:
-              if "</head>" in html.lower():
-                  pos = html.lower().rfind("</head>")
-                  html = html[:pos] + tags + html[pos:]
-              else:
-                  html = tags + html
-
-              index.write_text(html)
-          PY
-
-      - name: Generate custom or default app icon and splash artwork
-        env:
-          MANIFEST_JSON: ${{ inputs.manifest_json }}
-          PROJECT_TYPE: ${{ steps.project.outputs.type }}
-          PROJECT_ROOT: ${{ steps.project.outputs.root }}
-        run: |
-          set -euo pipefail
-
-          python3 -m pip install --quiet pillow
-
-          python3 - <<'PY'
-          import json, os, pathlib
-          from PIL import Image, ImageDraw, ImageFont
-
-          m = json.loads(os.environ["MANIFEST_JSON"])
-          branding = m.get("branding") or {}
-          name = str(m.get("app_name", "My App"))[:40]
-
-          def rgb(value, default):
+          if raw:
               try:
-                  value = str(value).lstrip("#")
-                  if len(value) == 6:
-                      return tuple(int(value[i:i+2], 16) for i in (0, 2, 4))
-              except Exception:
-                  pass
-              return default
-
-          primary = rgb(branding.get("primary_color", "#2457d6"), (36,87,214))
-          foreground = rgb(branding.get("secondary_color", "#ffffff"), (255,255,255))
-          background = rgb(branding.get("splash_background", "#ffffff"), (255,255,255))
-          font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-
-          def font(size):
-              try:
-                  return ImageFont.truetype(font_path, size)
-              except Exception:
-                  return ImageFont.load_default()
-
-          project_type = os.environ["PROJECT_TYPE"]
-
-          if project_type == "web":
-              res_dir = pathlib.Path("project/android/app/src/main/res")
+                  config = json.loads(raw)
+                  print("App configuration received")
+                  print(json.dumps(config, indent=2))
+              except Exception as error:
+                  print("Manifest JSON could not be parsed:", error)
+                  raise
           else:
-              gradle_root = pathlib.Path(os.environ["PROJECT_ROOT"])
-              res_dir = gradle_root / "app/src/main/res"
-
-          if not res_dir.exists():
-              raise SystemExit(f"Android app resources directory not found: {res_dir}")
-
-          custom_icon = None
-
-          for candidate in pathlib.Path("source").rglob("custom-icon.png"):
-              if candidate.is_file():
-                  custom_icon = candidate
-                  break
-
-          def make_icon(size):
-              if custom_icon:
-                  if custom_icon.stat().st_size > 5 * 1024 * 1024:
-                      raise SystemExit("Custom icon exceeds the 5 MB limit.")
-
-                  try:
-                      with Image.open(custom_icon) as uploaded:
-                          if uploaded.format not in ("PNG", "JPEG", "WEBP"):
-                              raise SystemExit("Custom icon must be PNG, JPG or WebP.")
-                          uploaded.load()
-                          icon = uploaded.convert("RGBA")
-                  except Exception as exc:
-                      raise SystemExit("Cannot read custom icon: " + str(exc))
-
-                  icon.thumbnail((size, size), Image.Resampling.LANCZOS)
-
-                  canvas = Image.new("RGBA", (size, size), (0,0,0,0))
-                  canvas.alpha_composite(
-                      icon,
-                      ((size-icon.width)//2, (size-icon.height)//2)
-                  )
-                  return canvas
-
-              im = Image.new("RGBA", (size,size), (0,0,0,0))
-              d = ImageDraw.Draw(im)
-              margin = int(size*.08)
-
-              d.rounded_rectangle(
-                  (margin,margin,size-margin,size-margin),
-                  radius=int(size*.22),
-                  fill=primary
-              )
-
-              label = "".join(x[0] for x in name.split()[:2]).upper() or "A"
-              f = font(int(size*.38))
-              box = d.textbbox((0,0), label, font=f)
-
-              d.text(
-                  ((size-(box[2]-box[0]))/2,
-                   (size-(box[3]-box[1]))/2-box[1]),
-                  label,
-                  fill=foreground,
-                  font=f
-              )
-
-              return im
-
-          for folder, size in {
-              "mipmap-mdpi":48,
-              "mipmap-hdpi":72,
-              "mipmap-xhdpi":96,
-              "mipmap-xxhdpi":144,
-              "mipmap-xxxhdpi":192
-          }.items():
-              path = res_dir / folder
-              path.mkdir(parents=True, exist_ok=True)
-
-              icon = make_icon(size)
-              icon.save(path / "ic_launcher.png")
-              icon.save(path / "ic_launcher_round.png")
-
-          adaptive_dir = res_dir / "mipmap-anydpi-v26"
-
-          for filename in ("ic_launcher.xml", "ic_launcher_round.xml"):
-              adaptive_file = adaptive_dir / filename
-              if adaptive_file.exists():
-                  adaptive_file.unlink()
-
-          if project_type == "web":
-              splash_dir = res_dir / "drawable"
-              splash_dir.mkdir(parents=True, exist_ok=True)
-
-              splash = Image.new("RGB", (1080,1920), background)
-              draw = ImageDraw.Draw(splash)
-              label = name[:24]
-              f = font(76)
-              box = draw.textbbox((0,0), label, font=f)
-
-              draw.text(
-                  ((1080-(box[2]-box[0]))/2,900),
-                  label,
-                  fill=primary,
-                  font=f
-              )
-
-              splash.save(splash_dir / "builder_splash.png")
-
-          print("Custom icon applied." if custom_icon else "Default icon generated.")
+              print("Using default ChatWave configuration")
           PY
 
-      - name: Configure Android app identity
-        if: steps.project.outputs.type == 'web'
-        env:
-          APP_NAME: ${{ steps.config.outputs.app_name }}
-          PACKAGE_ID: ${{ steps.config.outputs.package_id }}
-          APP_VERSION: ${{ steps.config.outputs.version }}
-          VERSION_CODE: ${{ steps.config.outputs.version_code }}
-        working-directory: project
+      - name: Generate Android app icon
         run: |
-          set -euo pipefail
+          mkdir -p android/app/src/main/res/drawable
 
-          python3 - <<'PY'
-          import os, pathlib, re
+          cat > android/app/src/main/res/drawable/chatwave_icon.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#128C7E"
+                  android:pathData="M54,4A50,50 0,1 0,54 104A50,50 0,1 0,54 4"/>
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M30,31h48v34h-26l-15,12v-12h-7z"/>
+          </vector>
+          EOF
 
-          app_name = os.environ["APP_NAME"]
-          package = os.environ["PACKAGE_ID"]
-          version = os.environ["APP_VERSION"]
-          code = os.environ["VERSION_CODE"]
+      - name: Configure Android app
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
 
-          gradle = pathlib.Path("android/app/build.gradle")
-          text = gradle.read_text()
+          path = Path("android/app/src/main/AndroidManifest.xml")
+          xml = path.read_text(encoding="utf-8")
 
-          text = re.sub(r'applicationId\s+"[^"]+"', f'applicationId "{package}"', text)
-          text = re.sub(r'versionCode\s+\d+', f'versionCode {code}', text)
-          text = re.sub(r'versionName\s+"[^"]+"', f'versionName "{version}"', text)
+          if "com.chatwave.app://login-callback" not in xml:
+              intent_filter = """
+                  <intent-filter>
+                      <action android:name="android.intent.action.VIEW" />
+                      <category android:name="android.intent.category.DEFAULT" />
+                      <category android:name="android.intent.category.BROWSABLE" />
+                      <data
+                          android:scheme="com.chatwave.app"
+                          android:host="login-callback" />
+                  </intent-filter>
+              """
 
-          gradle.write_text(text)
+              xml = xml.replace(
+                  "</activity>",
+                  intent_filter + "\n    </activity>",
+                  1
+              )
 
-          strings = pathlib.Path("android/app/src/main/res/values/strings.xml")
-          strings.parent.mkdir(parents=True, exist_ok=True)
-
-          safe_name = (
-              app_name.replace("&","&amp;")
-                      .replace("<","&lt;")
-                      .replace(">","&gt;")
-          )
-
-          strings.write_text(
-              '<?xml version="1.0" encoding="utf-8"?>\n'
-              '<resources>'
-              '<string name="app_name">' + safe_name + '</string>'
-              '<string name="title_activity_main">' + safe_name + '</string>'
-              '</resources>\n'
-          )
+          path.write_text(xml, encoding="utf-8")
+          print("Android deep link configured")
           PY
 
       - name: Build Android APK
-        if: steps.project.outputs.type == 'web'
-        working-directory: project/android
         run: |
+          cd android
           chmod +x gradlew
-          ./gradlew --no-daemon --stacktrace assembleDebug
+          ./gradlew assembleDebug --no-daemon
 
-      - name: Build native Android project
-        if: steps.project.outputs.type == 'native'
-        working-directory: ${{ steps.project.outputs.root }}
+      - name: Verify APK
         run: |
-          chmod +x gradlew
-          ./gradlew --no-daemon --stacktrace assembleDebug
+          APK="android/app/build/outputs/apk/debug/app-debug.apk"
 
-      - name: Locate APK
-        id: apk
-        run: |
-          set -euo pipefail
-
-          APK=$(find project source -type f -path "*/build/outputs/apk/*/*.apk" | head -n 1 || true)
-
-          if [ -z "$APK" ]; then
-            echo "APK output not found."
+          if [ ! -f "$APK" ]; then
+            echo "ERROR: APK file was not generated"
             exit 1
           fi
 
-          mkdir -p output
-          cp "$APK" output/app-debug.apk
-          echo "path=output/app-debug.apk" >> "$GITHUB_OUTPUT"
-          ls -lh output/app-debug.apk
+          ls -lh "$APK"
 
-      - name: Upload APK to GitHub Release
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChatWave-Android-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish APK release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.release_tag }}
-          REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          set -euo pipefail
-
-          RELEASES=$(curl -fsSL \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/releases?per_page=100")
-
-          RELEASE=$(echo "$RELEASES" | jq -c \
-            --arg tag "$TAG" \
-            '[.[] | select(.tag_name == $tag)][0] // empty')
-
-          if [ -z "$RELEASE" ]; then
-            echo "Draft release not found: $TAG"
-            exit 1
-          fi
-
-          RELEASE_ID=$(echo "$RELEASE" | jq -r '.id')
-
-          if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" = "null" ]; then
-            echo "Release ID not found."
-            exit 1
-          fi
-
-          curl -fsSL -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Content-Type: application/octet-stream" \
-            --data-binary @output/app-debug.apk \
-            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=app-debug.apk"
-
-      - name: Remove source ZIP from release
-        if: success()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.release_tag }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-
-          RELEASES=$(curl -fsSL \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/releases?per_page=100")
-
-          RELEASE=$(echo "$RELEASES" | jq -c \
-            --arg tag "$TAG" \
-            '[.[] | select(.tag_name == $tag)][0] // empty')
-
-          if [ -z "$RELEASE" ]; then
-            echo "Release not found: $TAG"
-            exit 1
-          fi
-
-          ASSET_ID=$(echo "$RELEASE" | jq -r \
-            '.assets[] | select(.name=="source.zip") | .id' | head -n 1)
-
-          if [ -n "$ASSET_ID" ] && [ "$ASSET_ID" != "null" ]; then
-            curl -fsSL -X DELETE \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/releases/assets/$ASSET_ID"
-          fi
-
-      - name: Publish GitHub Release
-        if: success()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.release_tag }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-
-          RELEASES=$(curl -fsSL \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/releases?per_page=100")
-
-          RELEASE=$(echo "$RELEASES" | jq -c \
-            --arg tag "$TAG" \
-            '[.[] | select(.tag_name == $tag)][0] // empty')
-
-          if [ -z "$RELEASE" ]; then
-            echo "Release not found: $TAG"
-            exit 1
-          fi
-
-          RELEASE_ID=$(echo "$RELEASE" | jq -r '.id')
-
-          curl -fsSL -X PATCH \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Content-Type: application/json" \
-            -d '{"draft":false,"prerelease":false}' \
-            "https://api.github.com/repos/$REPO/releases/$RELEASE_ID"
-
-      - name: Build summary
-        if: success()
-        run: |
-          echo "## APK build successful" >> "$GITHUB_STEP_SUMMARY"
-          echo "- App: ${{ steps.config.outputs.app_name }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Package: ${{ steps.config.outputs.package_id }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Version: ${{ steps.config.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- APK: app-debug.apk" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Release: ${{ inputs.release_tag }}" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Failure summary
-        if: failure()
-        run: |
-          echo "## APK build failed" >> "$GITHUB_STEP_SUMMARY"
-          echo "Check the failed step above for the exact error." >> "$GITHUB_STEP_SUMMARY"
+          gh release upload "$RELEASE_TAG" \
+            android/app/build/outputs/apk/debug/app-debug.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
