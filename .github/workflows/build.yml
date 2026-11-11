@@ -104,7 +104,6 @@ jobs:
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
-      # Draft releases are fetched through the releases list API.
       - name: Download source ZIP from draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -500,11 +499,11 @@ jobs:
               index.write_text(html)
           PY
 
-      - name: Generate original app icon and splash artwork
-        if: steps.project.outputs.type == 'web'
+      - name: Generate custom or default app icon and splash artwork
         env:
           MANIFEST_JSON: ${{ inputs.manifest_json }}
-        working-directory: project
+          PROJECT_TYPE: ${{ steps.project.outputs.type }}
+          PROJECT_ROOT: ${{ steps.project.outputs.root }}
         run: |
           set -euo pipefail
 
@@ -515,7 +514,7 @@ jobs:
           from PIL import Image, ImageDraw, ImageFont
 
           m = json.loads(os.environ["MANIFEST_JSON"])
-          b = m.get("branding") or {}
+          branding = m.get("branding") or {}
           name = str(m.get("app_name", "My App"))[:40]
 
           def rgb(value, default):
@@ -527,9 +526,9 @@ jobs:
                   pass
               return default
 
-          primary = rgb(b.get("primary_color", "#2457d6"), (36,87,214))
-          foreground = rgb(b.get("secondary_color", "#ffffff"), (255,255,255))
-          background = rgb(b.get("splash_background", "#ffffff"), (255,255,255))
+          primary = rgb(branding.get("primary_color", "#2457d6"), (36,87,214))
+          foreground = rgb(branding.get("secondary_color", "#ffffff"), (255,255,255))
+          background = rgb(branding.get("splash_background", "#ffffff"), (255,255,255))
           font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
           def font(size):
@@ -538,7 +537,48 @@ jobs:
               except Exception:
                   return ImageFont.load_default()
 
+          project_type = os.environ["PROJECT_TYPE"]
+
+          if project_type == "web":
+              res_dir = pathlib.Path("project/android/app/src/main/res")
+          else:
+              gradle_root = pathlib.Path(os.environ["PROJECT_ROOT"])
+              res_dir = gradle_root / "app/src/main/res"
+
+          if not res_dir.exists():
+              raise SystemExit(f"Android app resources directory not found: {res_dir}")
+
+          # Optional custom icon is expected inside the uploaded source ZIP.
+          custom_icon = None
+
+          for candidate in pathlib.Path("source").rglob("custom-icon.png"):
+              if candidate.is_file():
+                  custom_icon = candidate
+                  break
+
           def make_icon(size):
+              if custom_icon:
+                  if custom_icon.stat().st_size > 5 * 1024 * 1024:
+                      raise SystemExit("Custom icon exceeds the 5 MB limit.")
+
+                  try:
+                      with Image.open(custom_icon) as uploaded:
+                          if uploaded.format not in ("PNG", "JPEG", "WEBP"):
+                              raise SystemExit("Custom icon must be PNG, JPG or WebP.")
+                          uploaded.load()
+                          icon = uploaded.convert("RGBA")
+                  except Exception as exc:
+                      raise SystemExit("Cannot read custom icon: " + str(exc))
+
+                  icon.thumbnail((size, size), Image.Resampling.LANCZOS)
+
+                  canvas = Image.new("RGBA", (size, size), (0,0,0,0))
+                  canvas.alpha_composite(
+                      icon,
+                      ((size-icon.width)//2, (size-icon.height)//2)
+                  )
+                  return canvas
+
               im = Image.new("RGBA", (size,size), (0,0,0,0))
               d = ImageDraw.Draw(im)
               margin = int(size*.08)
@@ -563,8 +603,6 @@ jobs:
 
               return im
 
-          assets = pathlib.Path("android/app/src/main/res")
-
           for folder, size in {
               "mipmap-mdpi":48,
               "mipmap-hdpi":72,
@@ -572,30 +610,42 @@ jobs:
               "mipmap-xxhdpi":144,
               "mipmap-xxxhdpi":192
           }.items():
-              path = assets / folder
+              path = res_dir / folder
               path.mkdir(parents=True, exist_ok=True)
+
               icon = make_icon(size)
               icon.save(path / "ic_launcher.png")
               icon.save(path / "ic_launcher_round.png")
 
-          splash_dir = assets / "drawable"
-          splash_dir.mkdir(parents=True, exist_ok=True)
+          # Remove adaptive XML so Android uses the generated PNG icons.
+          adaptive_dir = res_dir / "mipmap-anydpi-v26"
 
-          splash = Image.new("RGB", (1080,1920), background)
-          draw = ImageDraw.Draw(splash)
-          label = name[:24]
-          f = font(76)
-          box = draw.textbbox((0,0), label, font=f)
+          for filename in ("ic_launcher.xml", "ic_launcher_round.xml"):
+              adaptive_file = adaptive_dir / filename
+              if adaptive_file.exists():
+                  adaptive_file.unlink()
 
-          draw.text(
-              ((1080-(box[2]-box[0]))/2,900),
-              label,
-              fill=primary,
-              font=f
-          )
+          # Generate splash artwork for web projects.
+          if project_type == "web":
+              splash_dir = res_dir / "drawable"
+              splash_dir.mkdir(parents=True, exist_ok=True)
 
-          splash.save(splash_dir / "builder_splash.png")
-          print("Generated app icon and splash artwork.")
+              splash = Image.new("RGB", (1080,1920), background)
+              draw = ImageDraw.Draw(splash)
+              label = name[:24]
+              f = font(76)
+              box = draw.textbbox((0,0), label, font=f)
+
+              draw.text(
+                  ((1080-(box[2]-box[0]))/2,900),
+                  label,
+                  fill=primary,
+                  font=f
+              )
+
+              splash.save(splash_dir / "builder_splash.png")
+
+          print("Custom icon applied." if custom_icon else "Default icon generated.")
           PY
 
       - name: Configure Android app identity
@@ -635,7 +685,6 @@ jobs:
                       .replace(">","&gt;")
           )
 
-          # FIX: Define both resources required by the Android manifest.
           strings.write_text(
               '<?xml version="1.0" encoding="utf-8"?>\n'
               '<resources>'
