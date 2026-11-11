@@ -1,3 +1,4 @@
+
 name: Advanced Cloud APK Builder
 
 on:
@@ -38,16 +39,10 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
           java-version: "17"
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          packages: 'platform-tools'
         with:
           packages: 'platform-tools'
 
@@ -61,6 +56,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
+          mkdir -p source
+
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern "*.zip" \
@@ -91,7 +88,6 @@ jobs:
       - name: Prepare web assets
         run: |
           mkdir -p www
-
           cp -R "$(dirname "${{ steps.detect.outputs.html_file }}")"/. www/
 
           test -f www/index.html || {
@@ -123,8 +119,6 @@ jobs:
 
       - name: Bundle native Capacitor plugins
         run: |
-          mkdir -p www
-
           cat > native-entry.js <<'EOF'
           import { App } from '@capacitor/app';
           import { Browser } from '@capacitor/browser';
@@ -181,6 +175,7 @@ jobs:
           path.write_text(html, encoding="utf-8")
           print("ChatWave native imports patched successfully")
           PY
+
       - name: Initialize Android project
         run: |
           npx cap add android
@@ -193,18 +188,13 @@ jobs:
           python3 <<'PY'
           import json
           import os
-          from pathlib import Path
 
           raw = os.environ.get("MANIFEST_JSON", "").strip()
 
           if raw:
-              try:
-                  config = json.loads(raw)
-                  print("App configuration received")
-                  print(json.dumps(config, indent=2))
-              except Exception as error:
-                  print("Manifest JSON could not be parsed:", error)
-                  raise
+              config = json.loads(raw)
+              print("App configuration received")
+              print(json.dumps(config, indent=2))
           else:
               print("Using default ChatWave configuration")
           PY
@@ -236,7 +226,7 @@ jobs:
           path = Path("android/app/src/main/AndroidManifest.xml")
           xml = path.read_text(encoding="utf-8")
 
-          if "com.chatwave.app://login-callback" not in xml:
+          if 'android:scheme="com.chatwave.app"' not in xml:
               intent_filter = """
                   <intent-filter>
                       <action android:name="android.intent.action.VIEW" />
