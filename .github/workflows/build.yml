@@ -173,7 +173,7 @@ jobs:
           path.write_text(html, encoding="utf-8")
           print("ChatWave native imports patched successfully")
           PY
-                - name: Initialize Android project
+      - name: Initialize Android project
         run: |
           npx cap add android
           npx cap sync android
