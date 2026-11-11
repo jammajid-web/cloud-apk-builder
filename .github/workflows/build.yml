@@ -51,27 +51,35 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y unzip zip python3
 
-      - name: Download source ZIP
+      - name: Download improved ChatWave source
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          mkdir -p source
+          mkdir -p source extracted
 
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --pattern "*.zip" \
+            --pattern "ChatWave-Improved-Source.zip" \
             --dir source
 
-          ZIP_FILE=$(find source -maxdepth 1 -name "*.zip" | head -n 1)
+          ZIP_FILE="source/ChatWave-Improved-Source.zip"
 
-          if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: Source ZIP not found"
+          if [ ! -f "$ZIP_FILE" ]; then
+            echo "ERROR: Improved source ZIP not found"
             exit 1
           fi
 
-          mkdir -p extracted
           unzip -q "$ZIP_FILE" -d extracted
+
+          HTML_FILE=$(find extracted -type f -name "index.html" | head -n 1)
+
+          if [ -z "$HTML_FILE" ]; then
+            echo "ERROR: index.html not found in source ZIP"
+            exit 1
+          fi
+
+          echo "ChatWave improved source extracted successfully"
 
       - name: Detect app source
         id: detect
@@ -196,8 +204,9 @@ jobs:
           from pathlib import Path
           import re
 
-          # Locate Android MainActivity
-          main_files = list(Path("android/app/src/main").rglob("MainActivity.java"))
+          main_files = list(
+              Path("android/app/src/main").rglob("MainActivity.java")
+          )
 
           if not main_files:
               raise SystemExit("ERROR: MainActivity.java not found")
@@ -323,12 +332,17 @@ jobs:
           }
           """
 
-          plugin_code = plugin_code.replace("PACKAGE_NAME", package_name)
+          plugin_code = plugin_code.replace(
+              "PACKAGE_NAME",
+              package_name
+          )
 
           plugin_file = main_file.parent / "MediaPermissionsPlugin.java"
-          plugin_file.write_text(plugin_code.strip() + "\n", encoding="utf-8")
+          plugin_file.write_text(
+              plugin_code.strip() + "\n",
+              encoding="utf-8"
+          )
 
-          # Register plugin before BridgeActivity initialization
           if "MediaPermissionsPlugin.class" not in main_text:
               if "super.onCreate(savedInstanceState);" in main_text:
                   main_text = main_text.replace(
@@ -338,23 +352,13 @@ jobs:
                       1
                   )
               else:
-                  main_text = re.sub(
-                      r"\}\s*$",
-                      """
-              @Override
-              public void onCreate(android.os.Bundle savedInstanceState) {
-                  registerPlugin(MediaPermissionsPlugin.class);
-                  super.onCreate(savedInstanceState);
-              }
-          }
-          """,
-                      main_text,
-                      count=1
+                  raise SystemExit(
+                      "ERROR: MainActivity onCreate method not found"
                   )
 
               main_file.write_text(main_text, encoding="utf-8")
 
-          print("Native MediaPermissions plugin created and registered")
+          print("MediaPermissions plugin created and registered")
           PY
 
       - name: Configure Android permissions and app icon
@@ -376,7 +380,11 @@ jobs:
               entry = f'<uses-permission android:name="{permission}" />'
 
               if permission not in xml:
-                  xml = xml.replace("<application", entry + "\n    <application", 1)
+                  xml = xml.replace(
+                      "<application",
+                      entry + "\n    <application",
+                      1
+                  )
 
           app_match = re.search(r'<application\b[^>]*>', xml)
 
@@ -385,10 +393,20 @@ jobs:
 
           app_tag = app_match.group(0)
 
-          if 'android:icon=' not in app_tag:
-              app_tag = app_tag[:-1] + ' android:icon="@drawable/chatwave_icon">'
+          for attribute in ("icon", "roundIcon"):
+              pattern = rf'\s+android:{attribute}="[^"]*"'
+              replacement = f' android:{attribute}="@drawable/chatwave_icon"'
 
-          xml = xml[:app_match.start()] + app_tag + xml[app_match.end():]
+              if re.search(pattern, app_tag):
+                  app_tag = re.sub(pattern, replacement, app_tag)
+              else:
+                  app_tag = app_tag[:-1] + replacement + ">"
+
+          xml = (
+              xml[:app_match.start()]
+              + app_tag
+              + xml[app_match.end():]
+          )
 
           if 'android:scheme="com.chatwave.app"' not in xml:
               intent_filter = """
@@ -402,11 +420,17 @@ jobs:
                   </intent-filter>
               """
 
-              xml = xml.replace("</activity>", intent_filter + "\n    </activity>", 1)
+              xml = xml.replace(
+                  "</activity>",
+                  intent_filter + "\n    </activity>",
+                  1
+              )
 
           path.write_text(xml, encoding="utf-8")
 
-          icon = Path("android/app/src/main/res/drawable/chatwave_icon.xml")
+          icon = Path(
+              "android/app/src/main/res/drawable/chatwave_icon.xml"
+          )
           icon.parent.mkdir(parents=True, exist_ok=True)
 
           icon.write_text("""<vector xmlns:android="http://schemas.android.com/apk/res/android"
