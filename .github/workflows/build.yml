@@ -178,15 +178,10 @@ jobs:
               else:
                   raise SystemExit("ERROR: HTML head tag not found")
 
-          remaining = pattern.search(html)
-
-          if remaining:
-              raise SystemExit(
-                  "ERROR: Remote Capacitor dynamic import remains"
-              )
+          if pattern.search(html):
+              raise SystemExit("ERROR: Remote Capacitor import remains")
 
           path.write_text(html, encoding="utf-8")
-
           print("Native imports patched successfully")
           PY
 
@@ -223,9 +218,11 @@ jobs:
               android:height="108dp"
               android:viewportWidth="108"
               android:viewportHeight="108">
+
               <path
                   android:fillColor="#128C7E"
                   android:pathData="M54,4A50,50 0,1 0,54 104A50,50 0,1 0,54 4"/>
+
               <path
                   android:fillColor="#FFFFFF"
                   android:pathData="M30,31h48v34h-26l-15,12v-12h-7z"/>
@@ -236,34 +233,40 @@ jobs:
         run: |
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           path = Path("android/app/src/main/AndroidManifest.xml")
           xml = path.read_text(encoding="utf-8")
-          import re
 
-       app_match = re.search(r'<application\b[^>]*>', xml)
-if not app_match:
-    raise SystemExit("Android application tag not found")
+          app_match = re.search(r'<application\b[^>]*>', xml)
 
- app_tag = app_match.group(0)
+          if not app_match:
+              raise SystemExit("Android application tag not found")
 
- app_tag = re.sub(
-    r'\s+android:icon="[^"]*"',
-    '',
-    app_tag
-)
-app_tag = re.sub(
-    r'\s+android:roundIcon="[^"]*"',
-    '',
-    app_tag
-)
+          app_tag = app_match.group(0)
 
-app_tag = app_tag[:-1] + (
-    ' android:icon="@drawable/chatwave_icon"'
-    ' android:roundIcon="@drawable/chatwave_icon">'
-)
+          app_tag = re.sub(
+              r'\s+android:icon="[^"]*"',
+              '',
+              app_tag
+          )
 
-xml = xml[:app_match.start()] + app_tag + xml[app_match.end():]
+          app_tag = re.sub(
+              r'\s+android:roundIcon="[^"]*"',
+              '',
+              app_tag
+          )
+
+          app_tag = app_tag[:-1] + (
+              ' android:icon="@drawable/chatwave_icon"'
+              ' android:roundIcon="@drawable/chatwave_icon">'
+          )
+
+          xml = (
+              xml[:app_match.start()]
+              + app_tag
+              + xml[app_match.end():]
+          )
 
           if 'android:scheme="com.chatwave.app"' not in xml:
               intent_filter = """
@@ -284,6 +287,8 @@ xml = xml[:app_match.start()] + app_tag + xml[app_match.end():]
               )
 
           path.write_text(xml, encoding="utf-8")
+
+          print("ChatWave launcher icon configured")
           print("Android deep link configured")
           PY
 
