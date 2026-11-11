@@ -239,6 +239,31 @@ jobs:
 
           path = Path("android/app/src/main/AndroidManifest.xml")
           xml = path.read_text(encoding="utf-8")
+          import re
+
+       app_match = re.search(r'<application\b[^>]*>', xml)
+if not app_match:
+    raise SystemExit("Android application tag not found")
+
+ app_tag = app_match.group(0)
+
+ app_tag = re.sub(
+    r'\s+android:icon="[^"]*"',
+    '',
+    app_tag
+)
+app_tag = re.sub(
+    r'\s+android:roundIcon="[^"]*"',
+    '',
+    app_tag
+)
+
+app_tag = app_tag[:-1] + (
+    ' android:icon="@drawable/chatwave_icon"'
+    ' android:roundIcon="@drawable/chatwave_icon">'
+)
+
+xml = xml[:app_match.start()] + app_tag + xml[app_match.end():]
 
           if 'android:scheme="com.chatwave.app"' not in xml:
               intent_filter = """
