@@ -79,7 +79,7 @@ jobs:
           HTML_FILE=$(find extracted -type f -name "index.html" | head -n 1)
 
           if [ -z "$HTML_FILE" ]; then
-            echo "ERROR: index.html not found in source ZIP"
+            echo "ERROR: index.html not found"
             exit 1
           fi
 
@@ -89,11 +89,7 @@ jobs:
         run: |
           mkdir -p www
           cp -R "$(dirname "${{ steps.detect.outputs.html_file }}")"/. www/
-
-          test -f www/index.html || {
-            echo "ERROR: www/index.html missing"
-            exit 1
-          }
+          test -f www/index.html
 
       - name: Install Capacitor dependencies
         run: |
@@ -122,10 +118,12 @@ jobs:
           cat > native-entry.js <<'EOF'
           import { App } from '@capacitor/app';
           import { Browser } from '@capacitor/browser';
+          import { registerPlugin } from '@capacitor/core';
 
           window.ChatWaveNative = {
             App,
-            Browser
+            Browser,
+            registerPlugin
           };
           EOF
 
@@ -147,7 +145,7 @@ jobs:
 
           pattern = re.compile(
               r"""(?:await\s*)?import\s*\(\s*(['"])"""
-              r"""https://esm\.sh/@capacitor/(app|browser)"""
+              r"""https://esm\.sh/@capacitor/(app|browser|core)"""
               r"""[^'"]*\1\s*\)""",
               re.IGNORECASE
           )
@@ -158,11 +156,14 @@ jobs:
               if plugin == "app":
                   return "Promise.resolve({ App: window.ChatWaveNative.App })"
 
-              return "Promise.resolve({ Browser: window.ChatWaveNative.Browser })"
+              if plugin == "browser":
+                  return "Promise.resolve({ Browser: window.ChatWaveNative.Browser })"
+
+              return "Promise.resolve({ registerPlugin: window.ChatWaveNative.registerPlugin })"
 
           html, count = pattern.subn(replace_import, html)
 
-          print(f"Replaced {count} remote Capacitor imports")
+          print(f"Replaced {count} Capacitor imports")
 
           if "chatwave-capacitor.js" not in html:
               script_tag = '<script src="./chatwave-capacitor.js"></script>'
@@ -182,13 +183,248 @@ jobs:
               raise SystemExit("ERROR: Remote Capacitor import remains")
 
           path.write_text(html, encoding="utf-8")
-          print("Native imports patched successfully")
           PY
 
       - name: Initialize Android project
         run: |
           npx cap add android
           npx cap sync android
+
+      - name: Install native microphone and camera plugin
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          # Locate Android MainActivity
+          main_files = list(Path("android/app/src/main").rglob("MainActivity.java"))
+
+          if not main_files:
+              raise SystemExit("ERROR: MainActivity.java not found")
+
+          main_file = main_files[0]
+          main_text = main_file.read_text(encoding="utf-8")
+
+          package_match = re.search(
+              r"^\s*package\s+([a-zA-Z0-9_.]+)\s*;",
+              main_text,
+              re.MULTILINE
+          )
+
+          if not package_match:
+              raise SystemExit("ERROR: Android package not found")
+
+          package_name = package_match.group(1)
+
+          plugin_code = """
+          package PACKAGE_NAME;
+
+          import android.Manifest;
+
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import com.getcapacitor.annotation.Permission;
+          import com.getcapacitor.annotation.PermissionCallback;
+
+          @CapacitorPlugin(
+              name = "MediaPermissions",
+              permissions = {
+                  @Permission(
+                      alias = "microphone",
+                      strings = { Manifest.permission.RECORD_AUDIO }
+                  ),
+                  @Permission(
+                      alias = "camera",
+                      strings = { Manifest.permission.CAMERA }
+                  )
+              }
+          )
+          public class MediaPermissionsPlugin extends Plugin {
+
+              @PluginMethod
+              public void request(PluginCall call) {
+                  requestPermissionForAliases(
+                      new String[]{"microphone", "camera"},
+                      call,
+                      "permissionsCallback"
+                  );
+              }
+
+              @PluginMethod
+              public void requestPermissions(PluginCall call) {
+                  requestPermissionForAliases(
+                      new String[]{"microphone", "camera"},
+                      call,
+                      "permissionsCallback"
+                  );
+              }
+
+              @PluginMethod
+              public void requestMicrophone(PluginCall call) {
+                  requestPermissionForAlias(
+                      "microphone",
+                      call,
+                      "microphoneCallback"
+                  );
+              }
+
+              @PluginMethod
+              public void requestCamera(PluginCall call) {
+                  requestPermissionForAlias(
+                      "camera",
+                      call,
+                      "cameraCallback"
+                  );
+              }
+
+              @PermissionCallback
+              private void permissionsCallback(PluginCall call) {
+                  JSObject result = new JSObject();
+
+                  result.put(
+                      "microphone",
+                      getPermissionState("microphone").toString().equals("granted")
+                  );
+
+                  result.put(
+                      "camera",
+                      getPermissionState("camera").toString().equals("granted")
+                  );
+
+                  call.resolve(result);
+              }
+
+              @PermissionCallback
+              private void microphoneCallback(PluginCall call) {
+                  JSObject result = new JSObject();
+
+                  result.put(
+                      "microphone",
+                      getPermissionState("microphone").toString().equals("granted")
+                  );
+
+                  call.resolve(result);
+              }
+
+              @PermissionCallback
+              private void cameraCallback(PluginCall call) {
+                  JSObject result = new JSObject();
+
+                  result.put(
+                      "camera",
+                      getPermissionState("camera").toString().equals("granted")
+                  );
+
+                  call.resolve(result);
+              }
+          }
+          """
+
+          plugin_code = plugin_code.replace("PACKAGE_NAME", package_name)
+
+          plugin_file = main_file.parent / "MediaPermissionsPlugin.java"
+          plugin_file.write_text(plugin_code.strip() + "\n", encoding="utf-8")
+
+          # Register plugin before BridgeActivity initialization
+          if "MediaPermissionsPlugin.class" not in main_text:
+              if "super.onCreate(savedInstanceState);" in main_text:
+                  main_text = main_text.replace(
+                      "super.onCreate(savedInstanceState);",
+                      "registerPlugin(MediaPermissionsPlugin.class);\n"
+                      "        super.onCreate(savedInstanceState);",
+                      1
+                  )
+              else:
+                  main_text = re.sub(
+                      r"\}\s*$",
+                      """
+              @Override
+              public void onCreate(android.os.Bundle savedInstanceState) {
+                  registerPlugin(MediaPermissionsPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+          }
+          """,
+                      main_text,
+                      count=1
+                  )
+
+              main_file.write_text(main_text, encoding="utf-8")
+
+          print("Native MediaPermissions plugin created and registered")
+          PY
+
+      - name: Configure Android permissions and app icon
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("android/app/src/main/AndroidManifest.xml")
+          xml = path.read_text(encoding="utf-8")
+
+          permissions = [
+              "android.permission.RECORD_AUDIO",
+              "android.permission.CAMERA",
+              "android.permission.MODIFY_AUDIO_SETTINGS"
+          ]
+
+          for permission in permissions:
+              entry = f'<uses-permission android:name="{permission}" />'
+
+              if permission not in xml:
+                  xml = xml.replace("<application", entry + "\n    <application", 1)
+
+          app_match = re.search(r'<application\b[^>]*>', xml)
+
+          if not app_match:
+              raise SystemExit("Android application tag not found")
+
+          app_tag = app_match.group(0)
+
+          if 'android:icon=' not in app_tag:
+              app_tag = app_tag[:-1] + ' android:icon="@drawable/chatwave_icon">'
+
+          xml = xml[:app_match.start()] + app_tag + xml[app_match.end():]
+
+          if 'android:scheme="com.chatwave.app"' not in xml:
+              intent_filter = """
+                  <intent-filter>
+                      <action android:name="android.intent.action.VIEW" />
+                      <category android:name="android.intent.category.DEFAULT" />
+                      <category android:name="android.intent.category.BROWSABLE" />
+                      <data
+                          android:scheme="com.chatwave.app"
+                          android:host="login-callback" />
+                  </intent-filter>
+              """
+
+              xml = xml.replace("</activity>", intent_filter + "\n    </activity>", 1)
+
+          path.write_text(xml, encoding="utf-8")
+
+          icon = Path("android/app/src/main/res/drawable/chatwave_icon.xml")
+          icon.parent.mkdir(parents=True, exist_ok=True)
+
+          icon.write_text("""<vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#128C7E"
+                  android:pathData="M54,4A50,50 0,1 0,54 104A50,50 0,1 0,54 4"/>
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M30,31h48v34h-26l-15,12v-12h-7z"/>
+          </vector>
+          """, encoding="utf-8")
+
+          print("Android permissions, deep link and icon configured")
+          PY
 
       - name: Apply app configuration
         env:
@@ -206,90 +442,6 @@ jobs:
               print(json.dumps(config, indent=2))
           else:
               print("Using default ChatWave configuration")
-          PY
-
-      - name: Generate Android app icon
-        run: |
-          mkdir -p android/app/src/main/res/drawable
-
-          cat > android/app/src/main/res/drawable/chatwave_icon.xml <<'EOF'
-          <vector xmlns:android="http://schemas.android.com/apk/res/android"
-              android:width="108dp"
-              android:height="108dp"
-              android:viewportWidth="108"
-              android:viewportHeight="108">
-
-              <path
-                  android:fillColor="#128C7E"
-                  android:pathData="M54,4A50,50 0,1 0,54 104A50,50 0,1 0,54 4"/>
-
-              <path
-                  android:fillColor="#FFFFFF"
-                  android:pathData="M30,31h48v34h-26l-15,12v-12h-7z"/>
-          </vector>
-          EOF
-
-      - name: Configure Android app
-        run: |
-          python3 <<'PY'
-          from pathlib import Path
-          import re
-
-          path = Path("android/app/src/main/AndroidManifest.xml")
-          xml = path.read_text(encoding="utf-8")
-
-          app_match = re.search(r'<application\b[^>]*>', xml)
-
-          if not app_match:
-              raise SystemExit("Android application tag not found")
-
-          app_tag = app_match.group(0)
-
-          app_tag = re.sub(
-              r'\s+android:icon="[^"]*"',
-              '',
-              app_tag
-          )
-
-          app_tag = re.sub(
-              r'\s+android:roundIcon="[^"]*"',
-              '',
-              app_tag
-          )
-
-          app_tag = app_tag[:-1] + (
-              ' android:icon="@drawable/chatwave_icon"'
-              ' android:roundIcon="@drawable/chatwave_icon">'
-          )
-
-          xml = (
-              xml[:app_match.start()]
-              + app_tag
-              + xml[app_match.end():]
-          )
-
-          if 'android:scheme="com.chatwave.app"' not in xml:
-              intent_filter = """
-                  <intent-filter>
-                      <action android:name="android.intent.action.VIEW" />
-                      <category android:name="android.intent.category.DEFAULT" />
-                      <category android:name="android.intent.category.BROWSABLE" />
-                      <data
-                          android:scheme="com.chatwave.app"
-                          android:host="login-callback" />
-                  </intent-filter>
-              """
-
-              xml = xml.replace(
-                  "</activity>",
-                  intent_filter + "\n    </activity>",
-                  1
-              )
-
-          path.write_text(xml, encoding="utf-8")
-
-          print("ChatWave launcher icon configured")
-          print("Android deep link configured")
           PY
 
       - name: Build Android APK
