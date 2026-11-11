@@ -1,4 +1,3 @@
-
 name: Advanced Cloud APK Builder
 
 on:
@@ -224,7 +223,6 @@ jobs:
 
           python3 <<'PY'
           from pathlib import Path
-          import re
 
           root = Path("android/build.gradle")
           app = Path("android/app/build.gradle")
@@ -432,7 +430,7 @@ jobs:
           print("MediaPermissions plugin installed")
           PY
 
-      - name: Configure Android permissions and icon
+      - name: Configure Android permissions, icon and OAuth deep link
         run: |
           python3 <<'PY'
           from pathlib import Path
@@ -478,6 +476,59 @@ jobs:
 
           xml = xml[:match.start()] + tag + xml[match.end():]
 
+          # Restore ChatWave Google OAuth deep-link intent filter.
+          deep_link_scheme = 'android:scheme="com.chatwave.app"'
+
+          if deep_link_scheme not in xml:
+              intent_filter = """
+                  <intent-filter>
+                      <action android:name="android.intent.action.VIEW" />
+                      <category android:name="android.intent.category.DEFAULT" />
+                      <category android:name="android.intent.category.BROWSABLE" />
+                      <data
+                          android:scheme="com.chatwave.app"
+                          android:host="login-callback" />
+                  </intent-filter>
+              """
+
+              activity_pattern = re.compile(
+                  r"<activity\b[^>]*>[\s\S]*?</activity>",
+                  re.IGNORECASE
+              )
+
+              activities = list(activity_pattern.finditer(xml))
+
+              launcher_activity = None
+
+              for activity in activities:
+                  block = activity.group(0)
+
+                  if (
+                      "android.intent.action.MAIN" in block
+                      and "android.intent.category.LAUNCHER" in block
+                  ):
+                      launcher_activity = activity
+                      break
+
+              if launcher_activity is None:
+                  raise SystemExit("Launcher activity not found")
+
+              block = launcher_activity.group(0)
+              block = block.replace(
+                  "</activity>",
+                  intent_filter + "\n</activity>",
+                  1
+              )
+
+              xml = (
+                  xml[:launcher_activity.start()]
+                  + block
+                  + xml[launcher_activity.end():]
+              )
+
+          if deep_link_scheme not in xml:
+              raise SystemExit("OAuth deep-link filter was not added")
+
           manifest.write_text(xml, encoding="utf-8")
 
           icon = Path(
@@ -500,7 +551,7 @@ jobs:
           </vector>
           """, encoding="utf-8")
 
-          print("Permissions and icon configured")
+          print("Permissions, icon and OAuth deep link configured")
           PY
 
       - name: Create ChatWave push notification bridge
