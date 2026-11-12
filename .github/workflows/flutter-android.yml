@@ -1,9 +1,11 @@
+
 name: ChatWave Final Android APK
 
 on:
   workflow_dispatch:
   push:
-    branches: [flutter-app]
+    branches:
+      - flutter-app
 
 permissions:
   contents: read
@@ -16,7 +18,8 @@ jobs:
   build:
     name: Build ChatWave Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -37,102 +40,261 @@ jobs:
       - name: Create Android host project
         run: flutter create --platforms=android --org com.chatwave --project-name chatwave .
 
+      - name: Install ChatWave Dart entrypoint
+        run: |
+          set -euo pipefail
+          mkdir -p lib
+          test -s main.dart
+          cp main.dart lib/main.dart
+
       - name: Create ChatWave icon and splash assets
         run: |
           python3 -m pip install --quiet pillow
           mkdir -p assets/icon assets/splash
+
           python3 - <<'PY'
           from PIL import Image, ImageDraw
           import math
+
           def make(path, size):
-              im=Image.new('RGBA',(size,size),(11,18,32,255)); p=im.load()
-              for y in range(size):
-                  for x in range(size):
-                      t=(x+y)/(2*size)
-                      p[x,y]=(int(13+12*t),int(44+95*t),int(59+87*t),255)
-              d=ImageDraw.Draw(im)
-              pad=int(size*.17); d.rounded_rectangle((pad,pad,size-pad,size-pad),radius=int(size*.22),fill=(24,185,158,255))
-              # three wave bands form a simple original chat/wave mark
-              cx=size*.5; cy=size*.49
-              for k,amp in enumerate((.10,.17,.24)):
-                  pts=[]
-                  for i in range(81):
-                      x=size*.29+i*size*.42/80
-                      y=cy+math.sin(i/80*math.pi*2)*size*amp*.35
-                      pts.append((x,y))
-                  d.line(pts,fill=(5,28,39,255),width=max(3,int(size*.035)),joint='curve')
-              d.ellipse((size*.62,size*.62,size*.70,size*.70),fill=(5,28,39,255))
+              im = Image.new("RGBA", (size, size), (11, 18, 32, 255))
+              draw = ImageDraw.Draw(im)
+              pad = int(size * .12)
+
+              draw.rounded_rectangle(
+                  (pad, pad, size-pad, size-pad),
+                  radius=int(size*.22),
+                  fill=(24, 185, 158, 255)
+              )
+
+              cy = size * .5
+              for amp in (.08, .14, .20):
+                  pts = []
+                  for i in range(101):
+                      x = size*.27 + i*size*.46/100
+                      y = cy + math.sin(i/100*math.pi*2)*size*amp
+                      pts.append((x, y))
+                  draw.line(
+                      pts,
+                      fill=(5, 28, 39, 255),
+                      width=max(3, int(size*.035))
+                  )
+
               im.save(path)
-          make('assets/icon/chatwave.png',1024)
-          make('assets/splash/chatwave_splash.png',512)
+
+          make("assets/icon/chatwave.png", 1024)
+          make("assets/splash/chatwave_splash.png", 512)
           PY
 
-      - name: Configure package, Firebase and AdMob
+      - name: Configure Firebase and Android package
         env:
           GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
           ADMOB_APP_ID: ${{ secrets.ADMOB_APP_ID }}
         run: |
           set -euo pipefail
-          test -n "$GOOGLE_SERVICES_JSON" || (echo 'Missing GOOGLE_SERVICES_JSON secret' && exit 1)
-          test -n "$ADMOB_APP_ID" || (echo 'Missing ADMOB_APP_ID secret' && exit 1)
+
+          test -n "$GOOGLE_SERVICES_JSON"
+          test -n "$ADMOB_APP_ID"
+
           mkdir -p android/app
           printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+
           python3 - <<'PY'
           from pathlib import Path
-          import re, os, json, xml.etree.ElementTree as ET
-          cfg=json.loads(Path('android/app/google-services.json').read_text())
-          packages=[c.get('client_info',{}).get('android_client_info',{}).get('package_name') for c in cfg.get('client',[])]
-          if 'com.chatwave.app' not in packages: raise SystemExit('google-services.json must include Android package com.chatwave.app; check Firebase app registration.')
-          app=Path('android/app/build.gradle.kts')
-          s=app.read_text()
-          s=re.sub(r'applicationId\s*=\s*"[^"]+"','applicationId = "com.chatwave.app"',s)
-          s=re.sub(r'namespace\s*=\s*"[^"]+"','namespace = "com.chatwave.app"',s)
-          s=re.sub(r'minSdk\s*=\s*flutter.minSdkVersion','minSdk = 23',s)
+          import json
+          import re
+          import os
+          import xml.etree.ElementTree as ET
+
+          cfg = json.loads(
+              Path("android/app/google-services.json").read_text()
+          )
+
+          packages = [
+              c.get("client_info", {})
+               .get("android_client_info", {})
+               .get("package_name")
+              for c in cfg.get("client", [])
+          ]
+
+          if "com.chatwave.app" not in packages:
+              raise SystemExit(
+                  "Firebase Android package must be com.chatwave.app"
+              )
+
+          app = Path("android/app/build.gradle.kts")
+          s = app.read_text()
+
+          s = re.sub(
+              r'applicationId\s*=\s*"[^"]+"',
+              'applicationId = "com.chatwave.app"',
+              s
+          )
+
+          s = re.sub(
+              r'namespace\s*=\s*"[^"]+"',
+              'namespace = "com.chatwave.app"',
+              s
+          )
+
+          s = re.sub(
+              r'minSdk\s*=\s*flutter.minSdkVersion',
+              'minSdk = 23',
+              s
+          )
+
           if 'id("com.google.gms.google-services")' not in s:
-              s=re.sub(r'(plugins\s*\{)',r'\1\n    id("com.google.gms.google-services")',s,count=1)
+              s = re.sub(
+                  r'(plugins\s*\{)',
+                  r'\1\n    id("com.google.gms.google-services")',
+                  s,
+                  count=1
+              )
+
           app.write_text(s)
-          settings=Path('android/settings.gradle.kts'); st=settings.read_text()
+
+          settings = Path("android/settings.gradle.kts")
+          st = settings.read_text()
+
           if 'com.google.gms.google-services' not in st:
-              st=re.sub(r'(plugins\s*\{)',r'\1\n    id("com.google.gms.google-services") version "4.4.4" apply false',st,count=1)
+              st = re.sub(
+                  r'(plugins\s*\{)',
+                  r'\1\n    id("com.google.gms.google-services") version "4.4.4" apply false',
+                  st,
+                  count=1
+              )
+
           settings.write_text(st)
-          main_files=list(Path('android/app/src/main/kotlin').rglob('MainActivity.kt'))
-          if not main_files: raise SystemExit('MainActivity.kt missing')
-          main=main_files[0]; source=main.read_text()
-          source=re.sub(r'^package\s+[\w.]+','package com.chatwave.app',source,count=1,flags=re.M)
-          target=Path('android/app/src/main/kotlin/com/chatwave/app/MainActivity.kt'); target.parent.mkdir(parents=True,exist_ok=True); target.write_text(source)
-          if main!=target: main.unlink()
-          manifest=Path('android/app/src/main/AndroidManifest.xml')
-          tree=ET.parse(manifest); root=tree.getroot(); android='{http://schemas.android.com/apk/res/android}'
-          for perm in ['android.permission.INTERNET','android.permission.RECORD_AUDIO','android.permission.CAMERA','android.permission.POST_NOTIFICATIONS']:
-              if not any(x.attrib.get(android+'name')==perm for x in root.findall('uses-permission')):
-                  ET.SubElement(root,'uses-permission',{android+'name':perm})
-          appnode=root.find('application')
-          appnode.set(android+'label','ChatWave')
-          if not any(x.attrib.get(android+'name')=='com.google.android.gms.ads.APPLICATION_ID' for x in appnode.findall('meta-data')):
-              ET.SubElement(appnode,'meta-data',{android+'name':'com.google.android.gms.ads.APPLICATION_ID',android+'value':os.environ['ADMOB_APP_ID']})
-          activity=appnode.find('activity')
-          if activity is None: raise SystemExit('Main activity missing')
-          exists=False
-          for filt in activity.findall('intent-filter'):
-              data=filt.find('data')
-              if data is not None and data.attrib.get(android+'scheme')=='com.chatwave.app': exists=True
+
+          main_files = list(
+              Path("android/app/src/main/kotlin").rglob("MainActivity.kt")
+          )
+
+          if not main_files:
+              raise SystemExit("MainActivity.kt missing")
+
+          main = main_files[0]
+          source = main.read_text()
+
+          source = re.sub(
+              r'^package\s+[\w.]+',
+              'package com.chatwave.app',
+              source,
+              count=1,
+              flags=re.M
+          )
+
+          target = Path(
+              "android/app/src/main/kotlin/com/chatwave/app/MainActivity.kt"
+          )
+          target.parent.mkdir(parents=True, exist_ok=True)
+          target.write_text(source)
+
+          if main != target:
+              main.unlink()
+
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+          tree = ET.parse(manifest)
+          root = tree.getroot()
+
+          android = "{http://schemas.android.com/apk/res/android}"
+
+          permissions = [
+              "android.permission.INTERNET",
+              "android.permission.RECORD_AUDIO",
+              "android.permission.POST_NOTIFICATIONS"
+          ]
+
+          for perm in permissions:
+              if not any(
+                  x.attrib.get(android + "name") == perm
+                  for x in root.findall("uses-permission")
+              ):
+                  ET.SubElement(
+                      root,
+                      "uses-permission",
+                      {android + "name": perm}
+                  )
+
+          appnode = root.find("application")
+          appnode.set(android + "label", "ChatWave")
+
+          meta_name = "com.google.android.gms.ads.APPLICATION_ID"
+
+          if not any(
+              x.attrib.get(android + "name") == meta_name
+              for x in appnode.findall("meta-data")
+          ):
+              ET.SubElement(
+                  appnode,
+                  "meta-data",
+                  {
+                      android + "name": meta_name,
+                      android + "value": os.environ["ADMOB_APP_ID"]
+                  }
+              )
+
+          activity = appnode.find("activity")
+
+          if activity is None:
+              raise SystemExit("Main activity missing")
+
+          exists = False
+
+          for filt in activity.findall("intent-filter"):
+              data = filt.find("data")
+              if data is not None and data.attrib.get(
+                  android + "scheme"
+              ) == "com.chatwave.app":
+                  exists = True
+
           if not exists:
-              f=ET.SubElement(activity,'intent-filter'); ET.SubElement(f,'action',{android+'name':'android.intent.action.VIEW'}); ET.SubElement(f,'category',{android+'name':'android.intent.category.DEFAULT'}); ET.SubElement(f,'category',{android+'name':'android.intent.category.BROWSABLE'}); ET.SubElement(f,'data',{android+'scheme':'com.chatwave.app',android+'host':'login-callback'})
-          ET.register_namespace('android','http://schemas.android.com/apk/res/android'); tree.write(manifest,encoding='utf-8',xml_declaration=True)
+              f = ET.SubElement(activity, "intent-filter")
+              ET.SubElement(
+                  f, "action",
+                  {android + "name": "android.intent.action.VIEW"}
+              )
+              ET.SubElement(
+                  f, "category",
+                  {android + "name": "android.intent.category.DEFAULT"}
+              )
+              ET.SubElement(
+                  f, "category",
+                  {android + "name": "android.intent.category.BROWSABLE"}
+              )
+              ET.SubElement(
+                  f, "data",
+                  {
+                      android + "scheme": "com.chatwave.app",
+                      android + "host": "login-callback"
+                  }
+              )
+
+          ET.register_namespace(
+              "android",
+              "http://schemas.android.com/apk/res/android"
+          )
+
+          tree.write(
+              manifest,
+              encoding="utf-8",
+              xml_declaration=True
+          )
           PY
 
       - name: Install Flutter packages
         run: flutter pub get
 
-      - name: Generate launcher icon and splash screen
-        run: |
-          dart run flutter_launcher_icons
-          dart run flutter_native_splash:create
+      - name: Generate launcher icon
+        run: dart run flutter_launcher_icons
+
+      - name: Generate splash screen
+        run: dart run flutter_native_splash:create
 
       - name: Format Dart source
         run: dart format lib
 
-      - name: Analyze source
+      - name: Analyze Flutter source
         run: flutter analyze --no-fatal-infos --no-fatal-warnings
 
       - name: Build final release APK
@@ -144,8 +306,10 @@ jobs:
           ADMOB_REWARDED_ID: ${{ secrets.ADMOB_REWARDED_ID }}
         run: |
           set -euo pipefail
-          test -n "$SUPABASE_URL" || (echo 'Missing SUPABASE_URL secret' && exit 1)
-          test -n "$SUPABASE_PUBLISHABLE_KEY" || (echo 'Missing SUPABASE_PUBLISHABLE_KEY secret' && exit 1)
+
+          test -n "$SUPABASE_URL"
+          test -n "$SUPABASE_PUBLISHABLE_KEY"
+
           flutter build apk --release \
             --dart-define=SUPABASE_URL="$SUPABASE_URL" \
             --dart-define=SUPABASE_PUBLISHABLE_KEY="$SUPABASE_PUBLISHABLE_KEY" \
@@ -153,7 +317,7 @@ jobs:
             --dart-define=ADMOB_INTERSTITIAL_ID="$ADMOB_INTERSTITIAL_ID" \
             --dart-define=ADMOB_REWARDED_ID="$ADMOB_REWARDED_ID"
 
-      - name: Publish final APK artifact
+      - name: Upload final APK
         uses: actions/upload-artifact@v4
         with:
           name: ChatWave-final-APK
